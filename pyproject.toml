@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "clash-cli"
+version = "0.1.0"
+description = "Clash proxy node manager with AI service unlock detection and TUI"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = [
+    "textual>=0.60",
+    "httpx>=0.27",
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+clash-cli = "clash_cli.app:main"
+ccli = "clash_cli.app:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/clash_cli"]

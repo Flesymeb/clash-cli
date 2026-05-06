@@ -1,0 +1,33 @@
+.idea
+.vscode
+test.sh
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.venv/
+venv/
+.env
+
+# Clash runtime (generated at runtime, not for version control)
+resources/cache.db
+resources/Country.mmdb
+resources/geosite.dat
+resources/mihomo.log
+resources/profiles.log
+resources/runtime.yaml
+resources/temp.yaml
+resources/config.yaml
+resources/dist/
+resources/zip/*
+!resources/zip/.gitkeep
+resources/profiles/*.yaml
+resources/profiles/.gitkeep
+
+!.gitkeep
