@@ -16,15 +16,10 @@ allow-lan: false # 若开启务必设置用户验证以防暴露公网后被滥�
 # inject (仅 proxy-groups)：按 name 匹配，把指定 proxy 追加到已有 group 的 .proxies 列表（自动去重）
 rules:
   prefix:
-    - DOMAIN,api64.ipify.org,DIRECT # 用于 clashui 获取真实公网 IP
     # - DOMAIN-KEYWORD,github,proxy   # 用于 clashupgrade 升级内核
     # no_proxy 直连规则
     - DOMAIN,localhost,DIRECT
     - IP-CIDR,127.0.0.1/32,DIRECT
-    - IP-CIDR,10.140.158.153/32,DIRECT
-    - DOMAIN-SUFFIX,pjlab.org.cn,DIRECT
-    - DOMAIN-SUFFIX,mineru.net,DIRECT
-    - DOMAIN-SUFFIX,openxlab.org.cn,DIRECT
   suffix:
     - MATCH,节点选择
 proxies:

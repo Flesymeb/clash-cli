@@ -1,7 +1,0 @@
-# 当前使用的订阅
-use: 1
-# 订阅列表
-profiles:
-  - id: 1
-    path: resources/profiles/1.yaml
-    url: ""  # 填入你的订阅链接

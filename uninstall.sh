@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+[ -f .env ] || /bin/cp .env.example .env
 . .env
 . "$CLASH_BASE_DIR/scripts/cmd/clashctl.sh" 2>/dev/null
 . scripts/preflight.sh

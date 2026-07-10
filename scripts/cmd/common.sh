@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2034
-. "$(dirname "$(dirname "$THIS_SCRIPT_DIR")")/.env"
+PROJECT_ROOT=$(dirname "$(dirname "$THIS_SCRIPT_DIR")")
+ENV_FILE="${PROJECT_ROOT}/.env"
+if [ ! -f "$ENV_FILE" ]; then
+    /bin/cp "${PROJECT_ROOT}/.env.example" "$ENV_FILE"
+fi
+. "$ENV_FILE"
 
 CLASH_RESOURCES_DIR="${CLASH_BASE_DIR}/resources"
 CLASH_CONFIG_BASE="${CLASH_RESOURCES_DIR}/config.yaml"

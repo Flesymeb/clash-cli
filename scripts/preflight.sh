@@ -359,6 +359,61 @@ _detect_rc() {
 _apply_rc() {
     _detect_rc
     local source_clashctl=". $CLASH_CMD_DIR/clashctl.sh"
+    local ccli_start_flag="# ccli START"
+    local ccli_end_flag="# ccli END"
+    local ccli_shell_init='ccli() {
+  case "$1" in
+    on)
+      shift
+      local out
+      out="$(command ccli ctl on "$@")"
+      local rc=$?
+      if [ "$rc" -eq 0 ]; then
+        eval "$(command ccli env)"
+        command ccli shell-status --proxy on
+      else
+        printf '"'"'%s\n'"'"' "$out"
+      fi
+      return "$rc"
+      ;;
+    off)
+      shift
+      local out
+      out="$(command ccli ctl off "$@")"
+      local rc=$?
+      eval "$(command ccli env --unset)"
+      if [ "$rc" -eq 0 ]; then
+        command ccli shell-status --proxy off
+      else
+        printf '"'"'%s\n'"'"' "$out"
+      fi
+      return "$rc"
+      ;;
+    proxy)
+      shift
+      local out
+      out="$(command ccli ctl proxy "$@")"
+      local rc=$?
+      case "$1" in
+        on)
+          [ "$rc" -eq 0 ] && eval "$(command ccli env)"
+          [ "$rc" -eq 0 ] && command ccli shell-status --proxy on || printf '"'"'%s\n'"'"' "$out"
+          ;;
+        off)
+          eval "$(command ccli env --unset)"
+          [ "$rc" -eq 0 ] && command ccli shell-status --proxy off || printf '"'"'%s\n'"'"' "$out"
+          ;;
+        *)
+          printf '"'"'%s\n'"'"' "$out"
+          ;;
+      esac
+      return "$rc"
+      ;;
+    *)
+      command ccli "$@"
+      ;;
+  esac
+}'
     # shellcheck disable=SC2086
     tee -a "$SHELL_RC_BASH" $SHELL_RC_ZSH >/dev/null <<EOF
 
@@ -369,13 +424,68 @@ $source_clashctl
 # watch_proxy
 $end_flag
 EOF
+    sed -i --follow-symlinks "/$ccli_start_flag/,/$ccli_end_flag/d" "$SHELL_RC_BASH" "$SHELL_RC_ZSH" 2>/dev/null
+    # shellcheck disable=SC2086
+    tee -a "$SHELL_RC_BASH" $SHELL_RC_ZSH >/dev/null <<EOF
+
+$ccli_start_flag
+# 加载 ccli 命令，并让 ccli on/off 影响当前 shell
+$ccli_shell_init
+$ccli_end_flag
+EOF
     [ -n "$SHELL_RC_FISH" ] && /usr/bin/install "$SCRIPT_CMD_FISH" "$SHELL_RC_FISH"
+    [ -n "$SHELL_RC_FISH" ] && {
+        local ccli_fish_rc="${SHELL_RC_FISH%/*}/ccli.fish"
+        cat >"$ccli_fish_rc" <<'EOF'
+function ccli
+    switch $argv[1]
+        case on
+            set -l out (command ccli ctl on $argv[2..-1])
+            set -l rc $status
+            if test $rc -eq 0
+                eval (command ccli env)
+                command ccli shell-status --proxy on
+            else
+                echo "$out"
+            end
+            return $rc
+        case off
+            set -l out (command ccli ctl off $argv[2..-1])
+            set -l rc $status
+            eval (command ccli env --unset)
+            if test $rc -eq 0
+                command ccli shell-status --proxy off
+            else
+                echo "$out"
+            end
+            return $rc
+        case proxy
+            set -l out (command ccli ctl proxy $argv[2..-1])
+            set -l rc $status
+            if test "$argv[2]" = on
+                eval (command ccli env)
+                command ccli shell-status --proxy on
+            else if test "$argv[2]" = off
+                eval (command ccli env --unset)
+                command ccli shell-status --proxy off
+            else
+                echo "$out"
+            end
+            return $rc
+        case '*'
+            command ccli $argv
+    end
+end
+EOF
+    }
     $source_clashctl
 }
 _revoke_rc() {
     _detect_rc
     sed -i --follow-symlinks "/$start_flag/,/$end_flag/d" "$SHELL_RC_BASH" "$SHELL_RC_ZSH" 2>/dev/null
+    sed -i --follow-symlinks "/# ccli START/,/# ccli END/d" "$SHELL_RC_BASH" "$SHELL_RC_ZSH" 2>/dev/null
     [ -n "$SHELL_RC_FISH" ] && rm -f "$SHELL_RC_FISH" 2>/dev/null
+    [ -n "$SHELL_RC_FISH" ] && rm -f "${SHELL_RC_FISH%/*}/ccli.fish" 2>/dev/null
 }
 
 _set_envs() {

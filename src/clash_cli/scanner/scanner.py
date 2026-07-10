@@ -30,11 +30,14 @@ async def _test_node_unlock(
     group_name: str = "节点选择",
 ) -> UnlockStatus:
     """Switch to node, test unlock, switch back."""
-    await client.switch_node(group_name, name)
-    await asyncio.sleep(0.3)
-    status = await check_unlock(proxy_url)
-    await client.switch_node(group_name, original_node)
-    return status
+    if not await client.switch_node(group_name, name):
+        return UnlockStatus(claude="fail", chatgpt="fail", gemini="fail")
+
+    try:
+        await asyncio.sleep(0.3)
+        return await check_unlock(proxy_url)
+    finally:
+        await client.switch_node(group_name, original_node)
 
 
 async def quick_scan(
@@ -42,8 +45,11 @@ async def quick_scan(
     group_name: str = "节点选择",
 ) -> ScanResult:
     """Random sample, test delay, then unlock for fast ones."""
-    nodes = await client.get_real_nodes()
-    original = await client.get_current_node(group_name)
+    group = await client.get_group(group_name)
+    if group.group_type.lower() == "fallback":
+        raise RuntimeError("fallback controls node selection; run ccli fallback off before scanning")
+    nodes = group.nodes
+    original = group.current
 
     sample = random.sample(nodes, min(sample_size, len(nodes)))
     sem = asyncio.Semaphore(12)
@@ -74,8 +80,8 @@ async def quick_scan(
             best = node
             break  # Found a working node, done
 
-    if best:
-        await client.switch_node(group_name, best.name)
+    if best and not await client.switch_node(group_name, best.name):
+        best = None
 
     return ScanResult(nodes=result_nodes, best=best)
 
@@ -84,8 +90,11 @@ async def full_scan(
     client: ClashClient, proxy_url: str, group_name: str = "节点选择",
 ) -> ScanResult:
     """Test all nodes: delay first, then unlock, sorted by speed."""
-    nodes = await client.get_real_nodes()
-    original = await client.get_current_node(group_name)
+    group = await client.get_group(group_name)
+    if group.group_type.lower() == "fallback":
+        raise RuntimeError("fallback controls node selection; run ccli fallback off before scanning")
+    nodes = group.nodes
+    original = group.current
 
     sem = asyncio.Semaphore(12)
     delay_tasks = [_test_node_delay(client, n, sem) for n in nodes]
@@ -107,7 +116,7 @@ async def full_scan(
         if unlock.all_ok and (best is None or delay < (best.delay or 99999)):
             best = node
 
-    if best:
-        await client.switch_node(group_name, best.name)
+    if best and not await client.switch_node(group_name, best.name):
+        best = None
 
     return ScanResult(nodes=result_nodes, best=best)

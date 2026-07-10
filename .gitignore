@@ -1,5 +1,7 @@
 .idea
 .vscode
+.codegraph/
+.DS_Store
 test.sh
 
 # Python
@@ -14,6 +16,14 @@ build/
 .venv/
 venv/
 .env
+.env.*
+!.env.example
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
 
 # Clash runtime (generated at runtime, not for version control)
 resources/cache.db
@@ -21,13 +31,24 @@ resources/Country.mmdb
 resources/geosite.dat
 resources/mihomo.log
 resources/profiles.log
+resources/*.db
+resources/*.mmdb
+resources/*.dat
+resources/*.log
+resources/*.tmp
+resources/*.raw
+resources/profiles.yaml
+resources/mixin.yaml
 resources/runtime.yaml
+resources/runtime.tmp
 resources/temp.yaml
 resources/config.yaml
 resources/dist/
 resources/zip/*
 !resources/zip/.gitkeep
-resources/profiles/*.yaml
-resources/profiles/.gitkeep
+resources/profiles/*
+!resources/profiles/.gitkeep
+!resources/profiles.example.yaml
+!resources/mixin.example.yaml
 
 !.gitkeep
