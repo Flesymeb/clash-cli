@@ -23,7 +23,8 @@ from textual.widgets import (
     Static,
 )
 
-from clash_cli.api.client import ClashClient
+from clash_cli import __version__
+from clash_cli.api.client import ClashClient, ClashApiError
 from clash_cli.api.models import Node, UnlockStatus
 from clash_cli.checker.unlock import check_all as check_unlock
 from clash_cli.clashctl import ClashctlBridge, ClashctlError, ClashctlResult, mask_url
@@ -832,7 +833,8 @@ def main():
             asyncio.run(cli_ctl([command, *rest]))
             return
 
-    parser = argparse.ArgumentParser(prog="clash-cli", description="Clash proxy node manager")
+    parser = argparse.ArgumentParser(prog="ccli", description="Clash proxy node manager")
+    parser.add_argument("--version", action="version", version=f"ccli {__version__}")
     sub = parser.add_subparsers(dest="command")
     scan_parser = sub.add_parser("scan", help="Scan nodes for AI unlock")
     scan_parser.add_argument("--full", action="store_true", help="Full scan (all nodes)")
@@ -1258,6 +1260,18 @@ async def cli_watch(interval: int = 120, once: bool = False):
                 print(f"[ok] {current} Claude:{unlock.claude} ChatGPT:{unlock.chatgpt} Gemini:{unlock.gemini}")
                 return True
             print(f"[FAIL] {current} Claude:{unlock.claude} ChatGPT:{unlock.chatgpt} Gemini:{unlock.gemini}")
+        except ClashApiError as e:
+            # API 不可达 → 多半 mihomo 挂了,尝试自愈拉起,不继续 scan(API 都不通 scan 也无意义)
+            print(f"[ERR] API unreachable: {e}")
+            try:
+                bridge = ClashctlBridge(config)
+                r = await bridge.on()
+                print(f"  [heal] mihomo start attempted: {last_output_line(r)}")
+            except ClashctlError as ce:
+                print(f"  [heal] mihomo start failed: {ce}")
+            except Exception as ce:
+                print(f"  [heal] mihomo start failed unexpectedly: {ce}")
+            return False
         except Exception as e:
             print(f"[ERR] {e}")
 

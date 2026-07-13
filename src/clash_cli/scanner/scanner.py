@@ -83,6 +83,10 @@ async def quick_scan(
     if best and not await client.switch_node(group_name, best.name):
         best = None
 
+    if best is None:
+        # 采样未命中可解锁节点,回退全节点扫描(full_scan 内部会自行切换到 best)
+        return await full_scan(client, proxy_url, group_name=group_name)
+
     return ScanResult(nodes=result_nodes, best=best)
 
 
