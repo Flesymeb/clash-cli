@@ -58,7 +58,7 @@ class ClashClient:
 
     async def get_proxies(self) -> dict[str, ProxyGroup]:
         try:
-            async with httpx.AsyncClient(timeout=10) as client:
+            async with httpx.AsyncClient(timeout=10, trust_env=False) as client:
                 resp = await client.get(
                     f"{self.api_base}/proxies", headers=self.headers
                 )
@@ -91,7 +91,7 @@ class ClashClient:
     async def get_group(self, name: str) -> ProxyGroup:
         encoded = _api_quote(name)
         try:
-            async with httpx.AsyncClient(timeout=10) as client:
+            async with httpx.AsyncClient(timeout=10, trust_env=False) as client:
                 resp = await client.get(
                     f"{self.api_base}/proxies/{encoded}", headers=self.headers
                 )
@@ -110,7 +110,7 @@ class ClashClient:
 
     async def ping(self) -> str:
         try:
-            async with httpx.AsyncClient(timeout=5) as client:
+            async with httpx.AsyncClient(timeout=5, trust_env=False) as client:
                 resp = await client.get(
                     f"{self.api_base}/proxies", headers=self.headers
                 )
@@ -155,7 +155,7 @@ class ClashClient:
     ) -> int:
         encoded = _api_quote(node_name)
         try:
-            async with httpx.AsyncClient(timeout=timeout / 1000 + 3) as client:
+            async with httpx.AsyncClient(timeout=timeout / 1000 + 3, trust_env=False) as client:
                 resp = await client.get(
                     f"{self.api_base}/proxies/{encoded}/delay",
                     params={"timeout": timeout, "url": url},
@@ -172,7 +172,7 @@ class ClashClient:
     async def switch_node(self, group_name: str, node_name: str) -> bool:
         encoded = _api_quote(group_name)
         try:
-            async with httpx.AsyncClient(timeout=10) as client:
+            async with httpx.AsyncClient(timeout=10, trust_env=False) as client:
                 resp = await client.put(
                     f"{self.api_base}/proxies/{encoded}",
                     json={"name": node_name},
@@ -189,7 +189,7 @@ class ClashClient:
 
     async def reload_config(self) -> bool:
         try:
-            async with httpx.AsyncClient(timeout=10) as client:
+            async with httpx.AsyncClient(timeout=10, trust_env=False) as client:
                 resp = await client.put(
                     f"{self.api_base}/configs",
                     json={"path": ""},

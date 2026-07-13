@@ -8,6 +8,7 @@ import re
 import signal
 import shutil
 import socket
+import subprocess
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -23,6 +24,25 @@ from clash_cli.config import Config
 HELP_FLAGS = {"-h", "--help"}
 URL_RE = re.compile(r"(?:https?|file)://[^\s'\"]+")
 LEGACY_DIRECT_IP_RULES = {"DOMAIN,API64.IPIFY.ORG,DIRECT"}
+HTML_RESPONSE_RE = re.compile(
+    r"<\s*(?:!doctype|html|head|body|title)(?:[\s>]|$)",
+    re.IGNORECASE,
+)
+
+
+class _QuotedString(str):
+    pass
+
+
+class _YamlDumper(yaml.SafeDumper):
+    pass
+
+
+def _represent_quoted_string(dumper: yaml.SafeDumper, value: _QuotedString) -> yaml.ScalarNode:
+    return dumper.represent_scalar("tag:yaml.org,2002:str", value, style='"')
+
+
+_YamlDumper.add_representer(_QuotedString, _represent_quoted_string)
 
 
 class ClashctlError(RuntimeError):
@@ -47,10 +67,29 @@ def _load_yaml(path: Path) -> dict[str, Any]:
         return yaml.safe_load(f) or {}
 
 
+def _prepare_yaml(value: Any, parent_key: str = "") -> Any:
+    if isinstance(value, dict):
+        prepared = {key: _prepare_yaml(item, str(key)) for key, item in value.items()}
+        if parent_key in {"reality-opts", "reality_opts"}:
+            for key in ("short-id", "short_id"):
+                if isinstance(prepared.get(key), str):
+                    prepared[key] = _QuotedString(prepared[key])
+        return prepared
+    if isinstance(value, list):
+        return [_prepare_yaml(item) for item in value]
+    return value
+
+
 def _write_yaml(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w") as f:
-        yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
+        yaml.dump(
+            _prepare_yaml(data),
+            f,
+            Dumper=_YamlDumper,
+            allow_unicode=True,
+            sort_keys=False,
+        )
 
 
 def _tail_file(path: Path, lines: int = 40) -> str:
@@ -447,6 +486,61 @@ class ClashctlBridge:
         if scheme not in ("http", "https"):
             raise ClashctlError("subscription URL must start with http://, https://, or file://")
 
+    def _normalize_subscription(self, dest: Path) -> None:
+        try:
+            payload = dest.read_bytes()
+        except OSError as e:
+            raise ClashctlError(f"subscription response cannot be read: {dest}") from e
+        if not payload.strip():
+            raise ClashctlError("subscription response is empty")
+
+        text: str | None = None
+        for encoding in ("utf-8-sig", "gb18030", "gbk", "big5"):
+            try:
+                text = payload.decode(encoding)
+                break
+            except UnicodeDecodeError:
+                continue
+        if text is None:
+            raise ClashctlError("subscription response is not valid UTF-8, GB18030, GBK, or BIG5 text")
+
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        if not text.strip():
+            raise ClashctlError("subscription response is empty")
+        dest.write_text(text, encoding="utf-8")
+
+    def _validate_subscription_content(self, dest: Path) -> None:
+        text = dest.read_text(encoding="utf-8")
+        if HTML_RESPONSE_RE.search(text[:8192]):
+            raise ClashctlError(
+                "subscription response looks like HTML; check the URL or subscription User-Agent"
+            )
+        try:
+            data = yaml.safe_load(text) or {}
+        except yaml.YAMLError as e:
+            raise ClashctlError(f"subscription response is invalid YAML: {e}") from e
+        if not isinstance(data, dict):
+            raise ClashctlError("subscription config must be a YAML mapping")
+
+        proxies = data.get("proxies", [])
+        providers = data.get("proxy-providers", {})
+        proxy_count = len(proxies) if isinstance(proxies, list) else 0
+        provider_count = len(providers) if isinstance(providers, dict) else 0
+        if proxy_count + provider_count == 0:
+            raise ClashctlError("subscription config does not contain any proxy nodes or providers")
+
+    def _prepare_subscription_content(self, dest: Path) -> None:
+        self._normalize_subscription(dest)
+        text = dest.read_text(encoding="utf-8")
+        if HTML_RESPONSE_RE.search(text[:8192]):
+            raise ClashctlError(
+                "subscription response looks like HTML; check the URL or subscription User-Agent"
+            )
+
+    async def _validate_subscription_config(self, dest: Path) -> None:
+        await self._valid_config(dest)
+        self._validate_subscription_content(dest)
+
     async def _download_raw_subscription(self, url: str, dest: Path) -> None:
         self._validate_subscription_source(url)
         headers = {"User-Agent": self.env.get("CLASH_SUB_UA", "clash-verge/v2.4.0")}
@@ -469,7 +563,7 @@ class ClashctlBridge:
 
     async def _subconverter_ready(self, port: int) -> bool:
         try:
-            async with httpx.AsyncClient(timeout=1) as client:
+            async with httpx.AsyncClient(timeout=1, trust_env=False) as client:
                 resp = await client.get(f"http://127.0.0.1:{port}/version")
             return resp.status_code == 200
         except httpx.HTTPError:
@@ -518,7 +612,7 @@ class ClashctlBridge:
         port = await self._prepare_subconverter_port()
         proc = await self._start_subconverter(port)
         try:
-            async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+            async with httpx.AsyncClient(timeout=30, follow_redirects=True, trust_env=False) as client:
                 try:
                     resp = await client.get(
                         f"http://127.0.0.1:{port}/sub",
@@ -538,12 +632,14 @@ class ClashctlBridge:
         raw_error_text = ""
         if force_convert:
             await self._download_converted_subscription(url, dest)
-            await self._valid_config(dest)
+            self._prepare_subscription_content(dest)
+            await self._validate_subscription_config(dest)
             return
 
         await self._download_raw_subscription(url, dest)
+        self._prepare_subscription_content(dest)
         try:
-            await self._valid_config(dest)
+            await self._validate_subscription_config(dest)
             if raw_path.exists():
                 raw_path.unlink()
             return
@@ -555,7 +651,8 @@ class ClashctlBridge:
 
         try:
             await self._download_converted_subscription(url, dest)
-            await self._valid_config(dest)
+            self._prepare_subscription_content(dest)
+            await self._validate_subscription_config(dest)
         except ClashctlError as convert_error:
             raise ClashctlError(
                 "subscription is not a valid Clash config after conversion\n"
@@ -1071,15 +1168,19 @@ class ClashctlBridge:
 
     def _pid(self) -> int | None:
         try:
-            for pid in os.listdir("/proc"):
-                if not pid.isdigit():
-                    continue
-                cmdline = Path("/proc") / pid / "cmdline"
-                text = cmdline.read_text(errors="ignore").replace("\x00", " ")
-                if str(self.kernel) in text:
-                    return int(pid)
+            pids = os.listdir("/proc")
         except OSError:
             return None
+        for pid in pids:
+            if not pid.isdigit():
+                continue
+            cmdline = Path("/proc") / pid / "cmdline"
+            try:
+                text = cmdline.read_text(errors="ignore").replace("\x00", " ")
+            except OSError:
+                continue
+            if str(self.kernel) in text:
+                return int(pid)
         return None
 
     def _codex_proxy_processes(self, proxy_url: str) -> tuple[int, int, int]:
@@ -1221,7 +1322,9 @@ class ClashctlBridge:
 
     async def restart_if_running(self) -> None:
         if self._pid():
-            await self.restart()
+            result = await self.restart()
+            if result.returncode != 0:
+                raise ClashctlError(result.stderr or result.stdout or f"failed to restart {self.kernel_name}")
 
     def ui(self) -> ClashctlResult:
         cfg = _load_yaml(self.runtime_config) or _load_yaml(self.mixin_config)
@@ -1253,16 +1356,66 @@ class ClashctlBridge:
     async def tun(self, args: Sequence[str]) -> ClashctlResult:
         mixin = _load_yaml(self.mixin_config)
         tun = mixin.setdefault("tun", {})
+        if not isinstance(tun, dict):
+            tun = {}
+            mixin["tun"] = tun
         if len(args) > 1:
             return ClashctlResult(2, stderr="usage: ccli tun [on|off]")
         if args and args[0] not in ("on", "off"):
             return ClashctlResult(2, stderr="usage: ccli tun [on|off]")
         if args and args[0] in ("on", "off"):
-            tun["enable"] = args[0] == "on"
-            _write_yaml(self.mixin_config, mixin)
-            await self.merge_config()
-            await self.restart_if_running()
+            enabled = args[0] == "on"
+            previous = bool(tun.get("enable"))
+            if enabled == previous:
+                return ClashctlResult(0, f"tun: {'on' if enabled else 'off'}")
+            if enabled and not self._kernel_has_tun_capability():
+                raise ClashctlError(
+                    f"{self.kernel_name} lacks CAP_NET_ADMIN; run: "
+                    f"sudo setcap cap_net_admin,cap_net_bind_service=+ep {self.kernel}"
+                )
+
+            was_running = bool(self._pid())
+            tun["enable"] = enabled
+            try:
+                _write_yaml(self.mixin_config, mixin)
+                await self.merge_config()
+                await self.restart_if_running()
+            except ClashctlError as change_error:
+                tun["enable"] = previous
+                _write_yaml(self.mixin_config, mixin)
+                restore_error = ""
+                try:
+                    await self.merge_config()
+                    if was_running and not self._pid():
+                        restored = await self.on()
+                        if restored.returncode != 0:
+                            restore_error = restored.stderr or restored.stdout
+                except ClashctlError as e:
+                    restore_error = str(e)
+                if restore_error:
+                    raise ClashctlError(
+                        f"{change_error}; rollback failed: {restore_error}"
+                    ) from change_error
+                raise
         return ClashctlResult(0, f"tun: {'on' if tun.get('enable') else 'off'}")
+
+    def _kernel_has_tun_capability(self) -> bool:
+        if os.geteuid() == 0:
+            return True
+        getcap = shutil.which("getcap")
+        if not getcap or not self.kernel.exists():
+            return False
+        try:
+            result = subprocess.run(
+                [getcap, str(self.kernel)],
+                text=True,
+                capture_output=True,
+                timeout=2,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return result.returncode == 0 and "cap_net_admin" in result.stdout.lower()
 
     async def mixin(self, args: Sequence[str]) -> ClashctlResult:
         if len(args) > 1:
@@ -1313,7 +1466,7 @@ class ClashctlBridge:
         config = Config.load(self.root)
         headers = {"Authorization": f"Bearer {config.secret}"}
         try:
-            async with httpx.AsyncClient(timeout=20) as client:
+            async with httpx.AsyncClient(timeout=20, trust_env=False) as client:
                 resp = await client.post(f"{config.api_base}/upgrade", params={"channel": channel}, headers=headers)
                 return ClashctlResult(0 if resp.is_success else 1, resp.text)
         except httpx.HTTPError as e:

@@ -18,6 +18,7 @@ _okcat '📦' "安装路径：$CLASH_BASE_DIR"
 touch "$CLASH_CONFIG_BASE"
 _set_envs
 _is_regular_sudo && chown -R "$SUDO_USER" "$CLASH_BASE_DIR"
+_grant_tun_capability
 
 _install_service
 _apply_rc

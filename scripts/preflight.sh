@@ -84,40 +84,92 @@ _load_zip() {
     ZIP_YQ=$(echo "${ZIP_BASE_DIR}"/yq*)
     ZIP_SUBCONVERTER=$(echo "${ZIP_BASE_DIR}"/subconverter*)
 }
+
+_fetch_latest_tag() {
+    local repo=$1 body tag
+    body=$(curl -sSL --fail --max-time 10 --retry 1 \
+        -H 'Accept: application/vnd.github+json' \
+        "https://api.github.com/repos/${repo}/releases/latest" 2>/dev/null) || return 1
+    tag=$(printf '%s' "$body" |
+        grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"[^"]+"' |
+        head -1 |
+        sed -E 's/.*"([^"]+)"[[:space:]]*$/\1/')
+    [ -n "$tag" ] && printf '%s\n' "$tag"
+}
+
+_resolve_version() {
+    local varname=$1 repo=$2
+    local pinned_version="${!varname}"
+    local check_latest="${CLASHCTL_CHECK_LATEST_VERSION:-1}"
+
+    if [ "$check_latest" = 1 ]; then
+        local tag
+        if tag=$(_fetch_latest_tag "$repo"); then
+            printf -v "$varname" '%s' "$tag"
+            _okcat 'version' "${repo} -> ${tag} (latest)"
+            return 0
+        fi
+        [ -n "$pinned_version" ] && {
+            printf -v "$varname" '%s' "$pinned_version"
+            _failcat 'warning' "latest version lookup failed; using ${repo} ${pinned_version}" || true
+            return 0
+        }
+        _failcat "cannot resolve latest ${repo} version and ${varname} is empty"
+        return 1
+    fi
+
+    [ -n "$pinned_version" ] || {
+        _failcat "${varname} is empty while latest version lookup is disabled"
+        return 1
+    }
+    printf -v "$varname" '%s' "$pinned_version"
+    _okcat 'version' "${repo} -> ${pinned_version} (pinned)"
+}
+
 _download_zip() {
     (($#)) || return 0
     local url_clash url_mihomo url_yq url_subconverter
     local arch=$(uname -m)
+
+    local item
+    for item in "$@"; do
+        case $item in
+        mihomo) _resolve_version VERSION_MIHOMO MetaCubeX/mihomo || return 1 ;;
+        yq) _resolve_version VERSION_YQ mikefarah/yq || return 1 ;;
+        subconverter) _resolve_version VERSION_SUBCONVERTER "${SUBCONVERTER_REPO:-tindy2013/subconverter}" || return 1 ;;
+        esac
+    done
+
     case "$arch" in
     x86_64)
         local flags=$(grep -m1 '^flags' /proc/cpuinfo)
         local level=v1
         grep -qw sse4_2 <<<"$flags" && grep -qw popcnt <<<"$flags" && level=v2
         grep -qw avx2 <<<"$flags" && grep -qw fma <<<"$flags" && level=v3
-        VERSION_MIHOMO=${level}-$VERSION_MIHOMO
+        local mihomo_asset_version=${level}-${VERSION_MIHOMO}
 
         url_clash=https://github.com/nelvko/clash-for-linux-install/releases/download/clash/clash-linux-amd64-2023.08.17.gz
-        url_mihomo=https://github.com/MetaCubeX/mihomo/releases/download/${VERSION_MIHOMO##*-}/mihomo-linux-amd64-${VERSION_MIHOMO}.gz
+        url_mihomo=https://github.com/MetaCubeX/mihomo/releases/download/${VERSION_MIHOMO}/mihomo-linux-amd64-${mihomo_asset_version}.gz
         url_yq=https://github.com/mikefarah/yq/releases/download/${VERSION_YQ}/yq_linux_amd64.tar.gz
-        url_subconverter=https://github.com/tindy2013/subconverter/releases/download/${VERSION_SUBCONVERTER}/subconverter_linux64.tar.gz
+        url_subconverter=https://github.com/${SUBCONVERTER_REPO:-tindy2013/subconverter}/releases/download/${VERSION_SUBCONVERTER}/subconverter_linux64.tar.gz
         ;;
     *86*)
         url_clash=https://github.com/nelvko/clash-for-linux-install/releases/download/clash/clash-linux-386-2023.08.17.gz
         url_mihomo=https://github.com/MetaCubeX/mihomo/releases/download/${VERSION_MIHOMO##*-}/mihomo-linux-386-${VERSION_MIHOMO}.gz
         url_yq=https://github.com/mikefarah/yq/releases/download/${VERSION_YQ}/yq_linux_386.tar.gz
-        url_subconverter=https://github.com/tindy2013/subconverter/releases/download/${VERSION_SUBCONVERTER}/subconverter_linux32.tar.gz
+        url_subconverter=https://github.com/${SUBCONVERTER_REPO:-tindy2013/subconverter}/releases/download/${VERSION_SUBCONVERTER}/subconverter_linux32.tar.gz
         ;;
     armv*)
         url_clash=https://github.com/nelvko/clash-for-linux-install/releases/download/clash/clash-linux-armv5-2023.08.17.gz
         url_mihomo=https://github.com/MetaCubeX/mihomo/releases/download/${VERSION_MIHOMO##*-}/mihomo-linux-armv7-${VERSION_MIHOMO}.gz
         url_yq=https://github.com/mikefarah/yq/releases/download/${VERSION_YQ}/yq_linux_arm.tar.gz
-        url_subconverter=https://github.com/tindy2013/subconverter/releases/download/${VERSION_SUBCONVERTER}/subconverter_armv7.tar.gz
+        url_subconverter=https://github.com/${SUBCONVERTER_REPO:-tindy2013/subconverter}/releases/download/${VERSION_SUBCONVERTER}/subconverter_armv7.tar.gz
         ;;
     aarch64)
         url_clash=https://github.com/nelvko/clash-for-linux-install/releases/download/clash/clash-linux-arm64-2023.08.17.gz
         url_mihomo=https://github.com/MetaCubeX/mihomo/releases/download/${VERSION_MIHOMO##*-}/mihomo-linux-arm64-${VERSION_MIHOMO}.gz
         url_yq=https://github.com/mikefarah/yq/releases/download/${VERSION_YQ}/yq_linux_arm64.tar.gz
-        url_subconverter=https://github.com/tindy2013/subconverter/releases/download/${VERSION_SUBCONVERTER}/subconverter_aarch64.tar.gz
+        url_subconverter=https://github.com/${SUBCONVERTER_REPO:-tindy2013/subconverter}/releases/download/${VERSION_SUBCONVERTER}/subconverter_aarch64.tar.gz
         ;;
     *)
         _error_quit "未知的架构版本：$arch，请自行下载对应版本至 ${ZIP_BASE_DIR} 目录"
@@ -131,7 +183,7 @@ _download_zip() {
         [subconverter]="$url_subconverter"
     )
 
-    local item target_zips=()
+    local target_zips=()
     _okcat '🖥️ ' "系统架构：$arch $level"
     for item in "$@"; do
         local url="${urls[$item]}"
@@ -145,6 +197,7 @@ _download_zip() {
             --fail \
             --insecure \
             --location \
+            --max-time "${CLASHCTL_DOWNLOAD_TIMEOUT:-60}" \
             --retry 1 \
             --output "$target" \
             "$url"
@@ -162,6 +215,31 @@ _valid_zip() {
 
     ((${#fail_zips[@]})) && _error_quit "文件验证失败：${fail_zips[*]} 请删除后重试，或自行下载对应版本至 ${ZIP_BASE_DIR} 目录"
 }
+
+_grant_tun_capability() {
+    [ "$KERNEL_NAME" = mihomo ] || return 0
+    command -v setcap >/dev/null || {
+        _failcat 'warning' 'setcap not found; ccli tun on will require CAP_NET_ADMIN' || true
+        return 0
+    }
+
+    local capability=cap_net_admin,cap_net_bind_service=+ep
+    local status=0
+    if _is_root; then
+        setcap "$capability" "$BIN_KERNEL" || status=$?
+    elif command -v sudo >/dev/null; then
+        sudo setcap "$capability" "$BIN_KERNEL" || status=$?
+    else
+        _failcat 'warning' "cannot grant CAP_NET_ADMIN to ${BIN_KERNEL}; install sudo or run setcap manually" || true
+        return 0
+    fi
+    [ "$status" -eq 0 ] || {
+        _failcat 'warning' "failed to grant CAP_NET_ADMIN to ${BIN_KERNEL}; run setcap manually" || true
+        return 0
+    }
+    _okcat 'tun' 'granted Mihomo CAP_NET_ADMIN capability'
+}
+
 _unzip_zip() {
     _valid_zip "$ZIP_KERNEL" "$ZIP_YQ" "$ZIP_SUBCONVERTER" "$ZIP_UI"
     /usr/bin/install -D <(gzip -dc "$ZIP_KERNEL") "$BIN_KERNEL"

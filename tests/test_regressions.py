@@ -8,13 +8,14 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 import yaml
 
 from clash_cli.api.models import ProxyGroup, UnlockStatus
 from clash_cli.api.client import ClashApiError, ClashClient
 from clash_cli.app import _sub_add_needs_prompt, proxy_exports, resolve_switch_target
-from clash_cli.clashctl import ClashctlBridge, _process_uses_proxy
+from clash_cli.clashctl import ClashctlBridge, ClashctlError, _process_uses_proxy, _write_yaml
 from clash_cli.config import Config
 import clash_cli.scanner.scanner as scanner
 
@@ -44,6 +45,12 @@ class CliRegressionTests(unittest.TestCase):
                 result = self.run_cli(*args)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn(expected, result.stdout)
+
+    def test_cli_version(self) -> None:
+        result = self.run_cli("--version")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(result.stdout.strip(), r"^ccli \d+\.\d+\.\d+$")
 
     def test_sub_add_prompt_detection(self) -> None:
         self.assertTrue(_sub_add_needs_prompt(["add"]))
@@ -92,6 +99,112 @@ class CliRegressionTests(unittest.TestCase):
             self.assertEqual(result.returncode, 1)
             self.assertIn("exited immediately", result.stderr)
             self.assertIn("fake kernel failed", result.stderr)
+
+    def test_yaml_writer_quotes_numeric_reality_short_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "runtime.yaml"
+            _write_yaml(
+                path,
+                {
+                    "proxies": [
+                        {
+                            "name": "node-a",
+                            "reality-opts": {"short-id": "09561058"},
+                        }
+                    ]
+                },
+            )
+
+            self.assertRegex(path.read_text(), r"short-id: ['\"]09561058['\"]")
+
+    def test_failed_validation_does_not_replace_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            resources = root / "resources"
+            bin_dir = root / "bin"
+            resources.mkdir()
+            bin_dir.mkdir()
+            (resources / "config.yaml").write_text(
+                "proxies: []\nproxy-groups: []\nrules: []\n"
+            )
+            (resources / "mixin.yaml").write_text("mixed-port: 7890\n")
+            (resources / "runtime.yaml").write_text("sentinel: unchanged\n")
+            kernel = bin_dir / "mihomo"
+            kernel.write_text("#!/usr/bin/env sh\necho invalid config >&2\nexit 7\n")
+            kernel.chmod(0o755)
+
+            bridge = ClashctlBridge(Config(clashctl_dir=root))
+            with self.assertRaisesRegex(ClashctlError, "invalid config"):
+                asyncio.run(bridge.merge_config())
+            self.assertEqual(
+                yaml.safe_load((resources / "runtime.yaml").read_text()),
+                {"sentinel": "unchanged"},
+            )
+
+    def test_subscription_rejects_html_without_trying_converter(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = ClashctlBridge(Config(clashctl_dir=Path(tmp)))
+
+            async def write_html(_url: str, dest: Path) -> None:
+                dest.write_text("<!doctype html><html><body>login</body></html>")
+
+            bridge._download_raw_subscription = write_html  # type: ignore[method-assign]
+            bridge._download_converted_subscription = AsyncMock()  # type: ignore[method-assign]
+
+            with self.assertRaisesRegex(ClashctlError, "HTML"):
+                asyncio.run(
+                    bridge._download_subscription(
+                        "https://example.com/subscription",
+                        Path(tmp) / "temp.yaml",
+                    )
+                )
+            bridge._download_converted_subscription.assert_not_awaited()
+
+    def test_subscription_normalizes_gb18030_and_crlf(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            resources = root / "resources"
+            bin_dir = root / "bin"
+            resources.mkdir()
+            bin_dir.mkdir()
+            kernel = bin_dir / "mihomo"
+            kernel.write_text("#!/usr/bin/env sh\nexit 0\n")
+            kernel.chmod(0o755)
+            source = root / "source.yaml"
+            source.write_bytes(
+                "proxies:\r\n  - name: \u8282\u70b9\r\n    type: direct\r\n".encode("gb18030")
+            )
+            destination = resources / "temp.yaml"
+            bridge = ClashctlBridge(Config(clashctl_dir=root))
+
+            asyncio.run(bridge._download_subscription(f"file://{source}", destination))
+
+            self.assertEqual(
+                destination.read_text(),
+                "proxies:\n  - name: \u8282\u70b9\n    type: direct\n",
+            )
+
+    def test_subscription_rejects_config_without_nodes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            resources = root / "resources"
+            bin_dir = root / "bin"
+            resources.mkdir()
+            bin_dir.mkdir()
+            kernel = bin_dir / "mihomo"
+            kernel.write_text("#!/usr/bin/env sh\nexit 0\n")
+            kernel.chmod(0o755)
+            source = root / "source.yaml"
+            source.write_text("proxies: []\nproxy-providers: {}\n")
+            bridge = ClashctlBridge(Config(clashctl_dir=root))
+
+            with self.assertRaisesRegex(ClashctlError, "does not contain any proxy"):
+                asyncio.run(
+                    bridge._download_subscription(
+                        f"file://{source}",
+                        resources / "temp.yaml",
+                    )
+                )
 
     def test_on_already_running_prints_status_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -314,6 +427,36 @@ class CliRegressionTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("switch", client.last_error)
 
+    def test_local_api_ignores_unsupported_proxy_environment(self) -> None:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = int(sock.getsockname()[1])
+
+        with patch.dict(
+            os.environ,
+            {"ALL_PROXY": "socks://127.0.0.1:1"},
+            clear=True,
+        ):
+            client = ClashClient(f"http://127.0.0.1:{port}", "secret")
+            try:
+                ok = asyncio.run(client.switch_node("节点选择", "node-a"))
+            except ValueError as error:
+                self.fail(f"local API inherited unsupported proxy environment: {error}")
+        self.assertFalse(ok)
+
+    def test_converter_health_check_ignores_unsupported_proxy_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ,
+            {"ALL_PROXY": "socks://127.0.0.1:1"},
+            clear=True,
+        ):
+            bridge = ClashctlBridge(Config(clashctl_dir=Path(tmp)))
+            try:
+                ready = asyncio.run(bridge._subconverter_ready(1))
+            except ValueError as error:
+                self.fail(f"converter health check inherited unsupported proxy environment: {error}")
+        self.assertFalse(ready)
+
     def test_subscription_id_validation_returns_usage(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             bridge = ClashctlBridge(Config(clashctl_dir=Path(tmp)))
@@ -355,6 +498,135 @@ class CliRegressionTests(unittest.TestCase):
             self.assertNotIn("user:password", logged)
             self.assertIn("https://example.com/...", listed)
             self.assertIn("https://example.com/...", logged)
+
+    def test_installer_version_resolution_falls_back_to_pinned_version(self) -> None:
+        repo = Path(__file__).resolve().parents[1]
+        script = r'''
+set -e
+CLASH_BASE_DIR=/tmp/clash-cli-test
+CLASH_RESOURCES_DIR="$CLASH_BASE_DIR/resources"
+source scripts/preflight.sh
+_okcat() { :; }
+_errorcat() { :; }
+_failcat() { return 0; }
+_fetch_latest_tag() { return 1; }
+CLASHCTL_CHECK_LATEST_VERSION=1
+VERSION_MIHOMO=v1.19.27
+_resolve_version VERSION_MIHOMO MetaCubeX/mihomo
+printf '%s' "$VERSION_MIHOMO"
+'''
+
+        result = subprocess.run(
+            ["bash", "-c", script],
+            cwd=repo,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "v1.19.27")
+
+    def test_installer_pins_current_dependency_versions(self) -> None:
+        env_example = (
+            Path(__file__).resolve().parents[1] / ".env.example"
+        ).read_text()
+
+        self.assertIn("VERSION_MIHOMO=v1.19.27", env_example)
+        self.assertIn("VERSION_YQ=v4.53.3", env_example)
+        self.assertIn("VERSION_SUBCONVERTER=v0.9.9", env_example)
+        self.assertIn("SUBCONVERTER_REPO=asdlokj1qpi233/subconverter", env_example)
+
+    def test_installer_grants_mihomo_tun_capability(self) -> None:
+        repo = Path(__file__).resolve().parents[1]
+        script = r'''
+set -e
+CLASH_BASE_DIR=/tmp/clash-cli-test
+CLASH_RESOURCES_DIR="$CLASH_BASE_DIR/resources"
+source scripts/preflight.sh
+_is_root() { return 0; }
+_okcat() { :; }
+_failcat() { return 0; }
+setcap() { printf '%s' "$*"; }
+KERNEL_NAME=mihomo
+BIN_KERNEL=/tmp/clash-cli-test/bin/mihomo
+_grant_tun_capability
+'''
+
+        result = subprocess.run(
+            ["bash", "-c", script],
+            cwd=repo,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("cap_net_admin", result.stdout)
+        self.assertIn("/tmp/clash-cli-test/bin/mihomo", result.stdout)
+
+    def test_tun_enable_requires_kernel_capability(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            resources = root / "resources"
+            bin_dir = root / "bin"
+            resources.mkdir()
+            bin_dir.mkdir()
+            (resources / "config.yaml").write_text(
+                "proxies:\n  - name: node-a\n    type: direct\n"
+            )
+            (resources / "mixin.yaml").write_text("tun:\n  enable: false\n")
+            kernel = bin_dir / "mihomo"
+            kernel.write_text("#!/usr/bin/env sh\nexit 0\n")
+            kernel.chmod(0o755)
+            bridge = ClashctlBridge(Config(clashctl_dir=root))
+
+            with patch.object(
+                bridge,
+                "_kernel_has_tun_capability",
+                return_value=False,
+                create=True,
+            ):
+                result = asyncio.run(bridge.clashctl(["tun", "on"]))
+
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("CAP_NET_ADMIN", result.stderr)
+            self.assertFalse(
+                yaml.safe_load((resources / "mixin.yaml").read_text())["tun"]["enable"]
+            )
+
+    def test_tun_change_rolls_back_when_restart_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            resources = root / "resources"
+            bin_dir = root / "bin"
+            resources.mkdir()
+            bin_dir.mkdir()
+            (resources / "config.yaml").write_text(
+                "proxies:\n  - name: node-a\n    type: direct\n"
+            )
+            (resources / "mixin.yaml").write_text("tun:\n  enable: false\n")
+            kernel = bin_dir / "mihomo"
+            kernel.write_text("#!/usr/bin/env sh\nexit 0\n")
+            kernel.chmod(0o755)
+            bridge = ClashctlBridge(Config(clashctl_dir=root))
+            bridge.restart_if_running = AsyncMock(  # type: ignore[method-assign]
+                side_effect=ClashctlError("restart failed")
+            )
+
+            with patch.object(
+                bridge,
+                "_kernel_has_tun_capability",
+                return_value=True,
+                create=True,
+            ):
+                result = asyncio.run(bridge.clashctl(["tun", "on"]))
+
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("restart failed", result.stderr)
+            self.assertFalse(
+                yaml.safe_load((resources / "mixin.yaml").read_text())["tun"]["enable"]
+            )
 
     def test_random_switch_target_excludes_current_node(self) -> None:
         async def run() -> None:

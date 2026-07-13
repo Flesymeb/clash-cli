@@ -23,6 +23,7 @@ pipx install git+https://github.com/Flesymeb/clash-cli.git
 
 ```bash
 ccli              # 启动 TUI
+ccli --version    # 查看 ccli 版本
 ccli status       # 查看当前节点解锁状态
 ccli status --no-check # 只看当前选择，不跑解锁检测
 ccli scan         # 快速扫描（随机 8 个，找到可用即换）
@@ -59,6 +60,10 @@ ccli shell-init --install  # 写入 ~/.bashrc / ~/.zshrc / fish conf.d
 TUI 快捷键：`↑↓` 导航 `Enter` 选择 `s` 扫描 `w` 守护 `h` 帮助 `q` 退出。订阅页中 `Enter` 切换订阅，`r` 更新订阅。
 
 注意：普通可执行文件不能把代理环境变量写回当前 shell。`install.sh` 会写入 shell 集成；如果你只通过 `pipx install` 安装了 Python 包，请补跑 `ccli shell-init --install`，然后重开终端。
+
+安装器会优先查询 Mihomo、yq 和 subconverter 的最新版本；网络不可用时回退到 `.env` 中的固定版本。Mihomo 安装完成后会尝试授予 TUN 所需的 `CAP_NET_ADMIN`，失败时 `ccli tun on` 会给出可直接执行的修复命令。
+
+订阅添加和更新会先规范化为 UTF-8，并拒绝空响应、HTML 登录页和未包含任何节点/provider 的配置；验证失败不会覆盖当前订阅。
 
 `ccli on` 只会更新当前 shell 的代理变量。已经运行的 Codex 或其他程序不会自动继承新环境；请先执行 `ccli on`，再启动对应程序。`ccli doctor` 会报告未继承代理变量的 Codex 进程。
 
