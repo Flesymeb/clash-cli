@@ -1097,7 +1097,8 @@ class ScannerRegressionTests(unittest.TestCase):
 
 class NodeListScreenTests(unittest.TestCase):
     def test_node_list_screen_exposes_informed_switch_actions(self) -> None:
-        from clash_cli.app import NODE_SKIP_NAMES, NodeListScreen
+        from clash_cli.app import NODE_SKIP_NAMES
+        from clash_cli.tui import NodeListScreen
 
         for action in ("action_test_unlock", "action_test_delays", "action_refresh_list"):
             self.assertTrue(
@@ -1109,6 +1110,19 @@ class NodeListScreenTests(unittest.TestCase):
         self.assertIn("d", binding_keys)
         for name in ("DIRECT", "REJECT", "自动选择", "故障转移"):
             self.assertIn(name, NODE_SKIP_NAMES)
+
+    def test_cli_path_does_not_import_textual(self) -> None:
+        import subprocess
+        env = os.environ.copy()
+        src = str(Path(__file__).resolve().parents[1] / "src")
+        env["PYTHONPATH"] = src + os.pathsep + env.get("PYTHONPATH", "")
+        result = subprocess.run(
+            [sys.executable, "-c",
+             "import sys, clash_cli.app; print('textual' in sys.modules)"],
+            text=True, capture_output=True, env=env, check=True,
+        )
+        self.assertEqual(result.stdout.strip(), "False",
+                         "importing clash_cli.app must not pull in textual")
 
 
 if __name__ == "__main__":
