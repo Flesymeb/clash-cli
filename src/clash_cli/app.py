@@ -9,6 +9,7 @@ import re
 import sys
 from pathlib import Path
 
+from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
@@ -224,7 +225,7 @@ class MainScreen(Screen):
                 break
             try:
                 unlock = await check_unlock(self.config.proxy_url)
-                if not unlock.all_ok:
+                if not unlock.primary_ok:
                     self.notify(
                         f"Node failed! Claude:{unlock.claude} ChatGPT:{unlock.chatgpt} Gemini:{unlock.gemini}",
                         severity="error",
@@ -388,6 +389,12 @@ class ScanScreen(Screen):
 
 # ── Node List Screen ───────────────────────────────────────────
 
+NODE_SKIP_NAMES = frozenset({
+    "DIRECT", "REJECT", "PASS", "REJECT-DROP",
+    "自动节点", "故障节点", "故障转移", "自动选择",
+})
+
+
 class NodeListScreen(Screen):
     BINDINGS = [
         Binding("up", "cursor_up", "Up", show=False),
@@ -396,10 +403,14 @@ class NodeListScreen(Screen):
         Binding("j", "cursor_down", "Down", show=False),
         Binding("escape", "back", "Back"),
         Binding("q", "back", "Back"),
+        Binding("t", "test_unlock", "Test"),
+        Binding("d", "test_delays", "Delays"),
         Binding("s", "quick_scan", "Quick Scan"),
         Binding("f", "full_scan", "Full Scan"),
         Binding("r", "refresh_list", "Refresh"),
     ]
+
+    DELAY_CONCURRENCY = 12
 
     def __init__(self, config: Config, client: ClashClient) -> None:
         super().__init__()
@@ -407,12 +418,18 @@ class NodeListScreen(Screen):
         self.client = client
         self._node_list: list[str] = []
         self._current_node: str = ""
+        self._group_type: str = ""
+        self._delays: dict[str, int] = {}
+        self._unlocks: dict[str, UnlockStatus] = {}
+        self._testing_unlock = False
+        self._render_gen = 0
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with Vertical():
             yield Static("", id="node-header", markup=False)
             yield DataTable(id="node-table")
+            yield Static("", id="node-status")
         yield Footer()
 
     async def on_mount(self) -> None:
@@ -427,22 +444,21 @@ class NodeListScreen(Screen):
 
         try:
             group = await self.client.get_group(self.config.selector_group)
-            chain = await self.client.get_proxy_chain(self.config.selector_group)
-            self._node_list = [n for n in group.nodes if n not in (
-                "DIRECT", "REJECT", "PASS", "REJECT-DROP",
-                "自动节点", "故障节点", "故障转移", "自动选择",
-            )]
-            self._current_node = chain[-1]
+            self._group_type = group.group_type
+            self._node_list = [n for n in group.nodes if n not in NODE_SKIP_NAMES]
+            try:
+                chain = await self.client.get_proxy_chain(self.config.selector_group)
+                self._current_node = chain[-1]
+            except Exception:
+                self._current_node = group.current
         except Exception:
             self._node_list = []
             self._current_node = ""
+            self._group_type = ""
 
-        header = self.query_one("#node-header", Static)
-        header.update(f"Nodes  group={self.config.selector_group}  current={self._current_node}")
-
+        self._render_header()
         for i, name in enumerate(self._node_list, 1):
-            marker = " →" if name == self._current_node else ""
-            table.add_row(str(i), f"{marker} {name}", "···", "···", "···", "···")
+            self._add_row(i, name)
 
         # Position cursor on current node
         try:
@@ -450,6 +466,80 @@ class NodeListScreen(Screen):
             table.move_cursor(row=idx)
         except (ValueError, Exception):
             pass
+
+        if self._node_list and not self._delays:
+            asyncio.create_task(self._test_all_delays())
+
+    def _render_header(self) -> None:
+        header = self.query_one("#node-header", Static)
+        mode = f"type={self._group_type}  " if self._group_type else ""
+        header.update(
+            f"Nodes  group={self.config.selector_group}  {mode}current={self._current_node}"
+        )
+
+    def _unlock_text(self, unlock: UnlockStatus | None, field: str) -> Text:
+        if unlock is None:
+            return Text("···", style=COLOR_DIM)
+        return Text.from_markup(color_unlock(getattr(unlock, field)))
+
+    def _add_row(self, index: int, name: str) -> None:
+        table = self.query_one("#node-table", DataTable)
+        marker = "→" if name == self._current_node else " "
+        delay = self._delays.get(name)
+        unlock = self._unlocks.get(name)
+        table.add_row(
+            str(index),
+            f"{marker} {name}",
+            Text.from_markup(color_delay(delay)),
+            self._unlock_text(unlock, "claude"),
+            self._unlock_text(unlock, "chatgpt"),
+            self._unlock_text(unlock, "gemini"),
+            key=name,
+        )
+
+    def _set_status(self, text: str) -> None:
+        self.query_one("#node-status", Static).update(text)
+
+    def _selected_node(self) -> str:
+        table = self.query_one("#node-table", DataTable)
+        try:
+            row = table.cursor_coordinate.row
+        except Exception:
+            row = getattr(table, "cursor_row", None)
+        if row is None or row < 0 or row >= len(self._node_list):
+            return ""
+        return self._node_list[row]
+
+    def _is_fallback(self) -> bool:
+        return self._group_type.lower() == "fallback"
+
+    async def _test_all_delays(self) -> None:
+        if not self._node_list:
+            return
+        gen = self._render_gen
+        table = self.query_one("#node-table", DataTable)
+        total = len(self._node_list)
+        sem = asyncio.Semaphore(self.DELAY_CONCURRENCY)
+        done = 0
+        self._set_status(f"Testing delays... 0/{total}")
+
+        async def test_one(name: str) -> None:
+            nonlocal done
+            async with sem:
+                delay = await self.client.test_delay(name)
+            if self._render_gen != gen:
+                return  # a refresh invalidated this batch
+            self._delays[name] = delay
+            try:
+                table.update_cell(name, "Latency", Text.from_markup(color_delay(delay)))
+            except Exception:
+                pass
+            done += 1
+            self._set_status(f"Testing delays... {done}/{total}")
+
+        await asyncio.gather(*[test_one(n) for n in self._node_list])
+        if self._render_gen == gen:
+            self._set_status("Delays ready.  t: test unlock | Enter: switch")
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         """Handle Enter on a row - switch to that node."""
@@ -459,6 +549,15 @@ class NodeListScreen(Screen):
             asyncio.create_task(self._do_switch(name))
 
     async def _do_switch(self, name: str) -> None:
+        if self._testing_unlock:
+            self.notify("Unlock test in progress, please wait", severity="warning", timeout=3)
+            return
+        if self._is_fallback():
+            self.notify(
+                "fallback controls selection; run ccli fallback off before manual switching",
+                severity="error", timeout=6,
+            )
+            return
         try:
             ok = await self.client.switch_node(self.config.selector_group, name)
         except Exception as e:
@@ -468,8 +567,76 @@ class NodeListScreen(Screen):
             detail = f": {self.client.last_error}" if self.client.last_error else ""
             self.notify(f"Failed to switch to: {name}{detail}", severity="error", timeout=6)
             return
+        old = self._current_node
+        self._current_node = name
+        self._refresh_marker(old)
+        self._refresh_marker(name)
+        self._render_header()
         self.notify(f"Switched to: {name}", severity="information", timeout=3)
-        await self._load_nodes()
+
+    def _refresh_marker(self, name: str) -> None:
+        if not name or name not in self._node_list:
+            return
+        table = self.query_one("#node-table", DataTable)
+        marker = "→" if name == self._current_node else " "
+        try:
+            table.update_cell(name, "Name", f"{marker} {name}")
+        except Exception:
+            pass
+
+    async def action_test_unlock(self) -> None:
+        name = self._selected_node()
+        if not name:
+            self.notify("No node selected", severity="warning", timeout=3)
+            return
+        if self._testing_unlock:
+            self.notify("Unlock test already running", severity="warning", timeout=3)
+            return
+        if self._is_fallback():
+            self.notify(
+                "fallback controls selection; run ccli fallback off before testing",
+                severity="error", timeout=6,
+            )
+            return
+        asyncio.create_task(self._test_node_unlock(name))
+
+    async def _test_node_unlock(self, name: str) -> None:
+        self._testing_unlock = True
+        self._set_status(f"Testing unlock on {name} (traffic rerouted briefly)...")
+        original = self._current_node or name
+        try:
+            if not await self.client.switch_node(self.config.selector_group, name):
+                self.notify(f"Failed to switch to {name}", severity="error", timeout=6)
+                return
+            await asyncio.sleep(0.3)
+            unlock = await check_unlock(self.config.proxy_url)
+            self._unlocks[name] = unlock
+            table = self.query_one("#node-table", DataTable)
+            for col, field in (("Claude", "claude"), ("ChatGPT", "chatgpt"), ("Gemini", "gemini")):
+                try:
+                    table.update_cell(name, col, self._unlock_text(unlock, field))
+                except Exception:
+                    pass
+            self.notify(
+                f"{name}: Claude {unlock.claude} | ChatGPT {unlock.chatgpt} | Gemini {unlock.gemini}",
+                severity="information" if unlock.primary_ok else "warning",
+                timeout=5,
+            )
+        except Exception as e:
+            self.notify(f"Test failed: {e}", severity="error", timeout=6)
+        finally:
+            if original and original != name:
+                await self.client.switch_node(self.config.selector_group, original)
+            self._testing_unlock = False
+            self._set_status("")
+
+    async def action_test_delays(self) -> None:
+        if self._testing_unlock:
+            self.notify("Unlock test in progress, please wait", severity="warning", timeout=3)
+            return
+        self._delays.clear()
+        self._render_gen += 1
+        await self._test_all_delays()
 
     def action_back(self) -> None:
         self.app.pop_screen()
@@ -481,6 +648,9 @@ class NodeListScreen(Screen):
         self.app.push_screen(ScanScreen(self.config, self.client, mode="full"))
 
     async def action_refresh_list(self) -> None:
+        self._delays.clear()
+        self._unlocks.clear()
+        self._render_gen += 1
         await self._load_nodes()
 
 
@@ -690,6 +860,9 @@ class HelpScreen(Screen):
 
 [bold]Node List[/]
   [bold]Enter[/]     Switch to selected node
+  [bold]t[/]         Test unlock on selected node
+  [bold]d[/]         Test delays for all nodes
+  [bold]r[/]         Refresh node list
   [bold]s[/]         Quick Scan
   [bold]f[/]         Full Scan
 
@@ -946,7 +1119,7 @@ async def cli_scan(full: bool = False):
         d = f"{node.delay}ms" if node.delay and node.delay > 0 else "timeout"
         print(f"{marker}{node.name:<20}  {d:<8}  Claude:{node.unlock.claude}  ChatGPT:{node.unlock.chatgpt}  Gemini:{node.unlock.gemini}")
     if result.best:
-        print(f"\nFound: {result.best.name} ({result.best.delay}ms, all unlocked)")
+        print(f"\nFound: {result.best.name} ({result.best.delay}ms, Claude and ChatGPT available)")
     else:
         print("\nNo fully unlocked node found")
 
@@ -1256,7 +1429,7 @@ async def cli_watch(interval: int = 120, once: bool = False):
         try:
             current = await client.get_current_node(config.selector_group)
             unlock = await check_unlock(config.proxy_url)
-            if unlock.all_ok:
+            if unlock.primary_ok:
                 print(f"[ok] {current} Claude:{unlock.claude} ChatGPT:{unlock.chatgpt} Gemini:{unlock.gemini}")
                 return True
             print(f"[FAIL] {current} Claude:{unlock.claude} ChatGPT:{unlock.chatgpt} Gemini:{unlock.gemini}")

@@ -32,6 +32,8 @@ ccli switch <名>   # 切换到指定节点
 ccli switch       # 随机切换一个节点，并输出延迟/解锁状态
 ccli fallback list # 查看可用于 fallback 的节点名
 ccli fallback set "主节点" "备用节点" # 配置有序故障转移
+ccli fallback auto --size 5 # 扫描当前订阅并生成自动 fallback 池
+ccli fallback refresh # 重新测速并刷新自动池
 ccli fallback     # 查看 fallback 当前落点和检测配置
 ccli fallback off # 关闭故障转移，恢复节点选择组
 ccli watch        # 后台守护（每 120s 检测，挂了自动切）
@@ -58,6 +60,8 @@ ccli shell-init --install  # 写入 ~/.bashrc / ~/.zshrc / fish conf.d
 ```
 
 TUI 快捷键：`↑↓` 导航 `Enter` 选择 `s` 扫描 `w` 守护 `h` 帮助 `q` 退出。订阅页中 `Enter` 切换订阅，`r` 更新订阅。
+
+`fallback auto` 会保留延迟检测成功且 Claude、ChatGPT 均可用的节点，按延迟排序并优先覆盖不同地区；Gemini 结果仅展示，不参与筛选。启用自动池后，`sub use` 和当前订阅的 `sub update` 会在内核运行时自动重建池；内核未运行或扫描失败时，新订阅仍会生效，但 fallback 会保持关闭并标记为 `stale`。
 
 注意：普通可执行文件不能把代理环境变量写回当前 shell。`install.sh` 会写入 shell 集成；如果你只通过 `pipx install` 安装了 Python 包，请补跑 `ccli shell-init --install`，然后重开终端。
 

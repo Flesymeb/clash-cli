@@ -17,6 +17,11 @@ class UnlockStatus:
             s.startswith("ok") for s in [self.claude, self.chatgpt, self.gemini]
         )
 
+    @property
+    def primary_ok(self) -> bool:
+        """Whether the required Claude and ChatGPT checks passed."""
+        return self.claude.startswith("ok") and self.chatgpt.startswith("ok")
+
     def summary(self) -> str:
         parts = []
         for name, val in [("Claude", self.claude), ("ChatGPT", self.chatgpt), ("Gemini", self.gemini)]:

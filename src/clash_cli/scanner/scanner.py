@@ -76,7 +76,7 @@ async def quick_scan(
         unlock = await _test_node_unlock(client, proxy_url, name, original, group_name)
         node = Node(name=name, delay=delay, unlock=unlock)
         result_nodes.append(node)
-        if unlock.all_ok and (best is None or delay < (best.delay or 99999)):
+        if unlock.primary_ok and (best is None or delay < (best.delay or 99999)):
             best = node
             break  # Found a working node, done
 
@@ -117,7 +117,7 @@ async def full_scan(
         unlock = await _test_node_unlock(client, proxy_url, name, original, group_name)
         node = Node(name=name, delay=delay, unlock=unlock)
         result_nodes.append(node)
-        if unlock.all_ok and (best is None or delay < (best.delay or 99999)):
+        if unlock.primary_ok and (best is None or delay < (best.delay or 99999)):
             best = node
 
     if best and not await client.switch_node(group_name, best.name):

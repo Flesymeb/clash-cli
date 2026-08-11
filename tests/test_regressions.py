@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, patch
 
 import yaml
 
-from clash_cli.api.models import ProxyGroup, UnlockStatus
+from clash_cli.api.models import Node, ProxyGroup, UnlockStatus
 from clash_cli.api.client import ClashApiError, ClashClient
 from clash_cli.app import _sub_add_needs_prompt, proxy_exports, resolve_switch_target
 from clash_cli.clashctl import ClashctlBridge, ClashctlError, _process_uses_proxy, _write_yaml
@@ -51,6 +51,13 @@ class CliRegressionTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertRegex(result.stdout.strip(), r"^ccli \d+\.\d+\.\d+$")
+
+    def test_fallback_help_lists_automatic_pool_commands(self) -> None:
+        result = self.run_cli("fallback", "--help")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ccli fallback auto [--size N]", result.stdout)
+        self.assertIn("ccli fallback refresh", result.stdout)
 
     def test_sub_add_prompt_detection(self) -> None:
         self.assertTrue(_sub_add_needs_prompt(["add"]))
@@ -319,6 +326,7 @@ class CliRegressionTests(unittest.TestCase):
                 "    proxies: [node-a]\n"
                 "rules:\n"
                 "  - GEOIP,CN,DIRECT\n"
+                "  - DOMAIN-KEYWORD,google,provider-group\n"
                 "  - MATCH,provider-group\n"
             )
             (resources / "mixin.yaml").write_text(
@@ -339,6 +347,16 @@ class CliRegressionTests(unittest.TestCase):
             self.assertEqual([rule for rule in rules if rule.startswith("MATCH,")], ["MATCH,节点选择"])
             self.assertEqual(rules[-1], "MATCH,节点选择")
             self.assertNotIn("DOMAIN,api64.ipify.org,DIRECT", rules)
+            expected_ai_rules = [
+                "DOMAIN-SUFFIX,claude.ai,节点选择",
+                "DOMAIN-SUFFIX,anthropic.com,节点选择",
+                "DOMAIN-SUFFIX,chatgpt.com,节点选择",
+                "DOMAIN-SUFFIX,openai.com,节点选择",
+                "DOMAIN,gemini.google.com,节点选择",
+            ]
+            for rule in expected_ai_rules:
+                self.assertIn(rule, rules)
+                self.assertLess(rules.index(rule), rules.index("DOMAIN-KEYWORD,google,provider-group"))
             group_names = {group["name"] for group in runtime["proxy-groups"]}
             self.assertIn("节点选择", group_names)
 
@@ -377,6 +395,10 @@ class CliRegressionTests(unittest.TestCase):
             fallback = next(group for group in runtime["proxy-groups"] if group["name"] == "ccli-fallback")
             self.assertEqual(fallback["type"], "fallback")
             self.assertEqual(fallback["proxies"], ["node-a", "node-b"])
+            self.assertEqual(fallback["url"], "https://chat.openai.com/cdn-cgi/trace")
+            self.assertEqual(fallback["interval"], 15)
+            self.assertEqual(fallback["max-failed-times"], 1)
+            self.assertFalse(fallback["lazy"])
             self.assertEqual(runtime["rules"][-1], "MATCH,ccli-fallback")
             self.assertEqual(Config.load(root).selector_group, "ccli-fallback")
 
@@ -396,6 +418,304 @@ class CliRegressionTests(unittest.TestCase):
             result = asyncio.run(bridge.clashctl(["fallback", "set", "node-a", "node-b"]))
             self.assertEqual(result.returncode, 1)
             self.assertIn("unknown fallback node", result.stderr)
+
+    def test_auto_fallback_candidates_require_unlock_and_prefer_regions(self) -> None:
+        bridge = ClashctlBridge(Config())
+        choose = getattr(bridge, "_select_auto_fallback_nodes", None)
+        self.assertIsNotNone(choose, "automatic fallback selector is missing")
+        ok = UnlockStatus(claude="ok:US", chatgpt="ok:US", gemini="ok:USA")
+        blocked = UnlockStatus(claude="ok:US", chatgpt="blocked:CN", gemini="ok:USA")
+        gemini_blocked = UnlockStatus(claude="ok:CA", chatgpt="ok:CA", gemini="blocked:CHN")
+        nodes = [
+            Node("香港-01", delay=10, unlock=blocked),
+            Node("日本-01", delay=20, unlock=ok),
+            Node("日本-02", delay=25, unlock=ok),
+            Node("加拿大-01", delay=30, unlock=gemini_blocked),
+            Node("美国-01", delay=40, unlock=ok),
+            Node("新加坡-01", delay=55, unlock=ok),
+            Node("台湾-timeout", delay=-1, unlock=ok),
+        ]
+
+        selected = choose(nodes, 3)
+
+        self.assertEqual([node.name for node in selected], ["日本-01", "加拿大-01", "美国-01"])
+
+    def test_fallback_auto_and_refresh_persist_pool_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            resources = root / "resources"
+            bin_dir = root / "bin"
+            resources.mkdir()
+            bin_dir.mkdir()
+            (resources / "config.yaml").write_text(
+                "proxies:\n"
+                "  - {name: 日本-01, type: http, server: 127.0.0.1, port: 8080}\n"
+                "  - {name: 美国-01, type: http, server: 127.0.0.1, port: 8081}\n"
+                "  - {name: 新加坡-01, type: http, server: 127.0.0.1, port: 8082}\n"
+                "proxy-groups:\n"
+                "  - name: 节点选择\n"
+                "    type: select\n"
+                "    proxies: [日本-01, 美国-01, 新加坡-01]\n"
+                "rules:\n"
+                "  - MATCH,节点选择\n"
+            )
+            (resources / "mixin.yaml").write_text(
+                "secret: test-secret\n"
+                "rules:\n"
+                "  suffix:\n"
+                "    - MATCH,节点选择\n"
+            )
+            (resources / "profiles.yaml").write_text("use: 4\nprofiles: []\n")
+            kernel = bin_dir / "mihomo"
+            kernel.write_text("#!/usr/bin/env sh\nexit 0\n")
+            kernel.chmod(0o755)
+            bridge = ClashctlBridge(Config.load(root))
+            bridge._pid = lambda: 123  # type: ignore[method-assign]
+            bridge.restart_if_running = AsyncMock()  # type: ignore[method-assign]
+            ok = UnlockStatus(claude="ok:US", chatgpt="ok:US", gemini="ok:USA")
+            bridge._discover_auto_fallback_nodes = AsyncMock(  # type: ignore[attr-defined]
+                side_effect=[
+                    [
+                        Node("日本-01", delay=20, unlock=ok),
+                        Node("美国-01", delay=40, unlock=ok),
+                        Node("新加坡-01", delay=55, unlock=ok),
+                    ],
+                    [
+                        Node("美国-01", delay=35, unlock=ok),
+                        Node("日本-01", delay=45, unlock=ok),
+                    ],
+                ]
+            )
+
+            enabled = asyncio.run(bridge.clashctl(["fallback", "auto", "--size", "3"]))
+            self.assertEqual(enabled.returncode, 0, enabled.stderr)
+            settings = yaml.safe_load((resources / "mixin.yaml").read_text())["_custom"]["fallback"]
+            self.assertEqual(settings["mode"], "auto")
+            self.assertEqual(settings["size"], 3)
+            self.assertEqual(settings["source-sub"], 4)
+            self.assertFalse(settings["stale"])
+            self.assertTrue(settings["updated-at"])
+            self.assertEqual(settings["nodes"], ["日本-01", "美国-01", "新加坡-01"])
+
+            refreshed = asyncio.run(bridge.clashctl(["fallback", "refresh"]))
+            self.assertEqual(refreshed.returncode, 0, refreshed.stderr)
+            settings = yaml.safe_load((resources / "mixin.yaml").read_text())["_custom"]["fallback"]
+            self.assertEqual(settings["nodes"], ["美国-01", "日本-01"])
+            bridge._discover_auto_fallback_nodes.assert_awaited_with(3)  # type: ignore[attr-defined]
+
+    def test_fallback_auto_returns_scan_errors_without_a_traceback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            resources = root / "resources"
+            resources.mkdir()
+            (resources / "mixin.yaml").write_text(
+                "secret: test-secret\n"
+                "_custom:\n"
+                "  selector-group: 节点选择\n"
+            )
+            bridge = ClashctlBridge(Config.load(root))
+            bridge._pid = lambda: 123  # type: ignore[method-assign]
+
+            with patch("clash_cli.clashctl.full_scan", new=AsyncMock(side_effect=ValueError("bad API data"))):
+                try:
+                    result = asyncio.run(bridge.clashctl(["fallback", "auto"]))
+                except ValueError as error:
+                    self.fail(f"scan error escaped as a traceback: {error}")
+
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("automatic fallback scan failed: bad API data", result.stderr)
+            settings = yaml.safe_load((resources / "mixin.yaml").read_text())["_custom"].get("fallback")
+            self.assertIsNone(settings)
+
+    def test_fallback_on_rejects_nodes_missing_from_current_subscription(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            resources = root / "resources"
+            bin_dir = root / "bin"
+            resources.mkdir()
+            bin_dir.mkdir()
+            (resources / "config.yaml").write_text(
+                "proxies:\n"
+                "  - {name: node-a, type: http, server: 127.0.0.1, port: 8080}\n"
+                "proxy-groups:\n"
+                "  - {name: 节点选择, type: select, proxies: [node-a]}\n"
+                "rules: [MATCH,节点选择]\n"
+            )
+            (resources / "mixin.yaml").write_text(
+                "_custom:\n"
+                "  selector-group: 节点选择\n"
+                "  fallback:\n"
+                "    enable: false\n"
+                "    mode: static\n"
+                "    nodes: [node-a, removed-node]\n"
+            )
+            kernel = bin_dir / "mihomo"
+            kernel.write_text("#!/usr/bin/env sh\nexit 0\n")
+            kernel.chmod(0o755)
+            before = (resources / "mixin.yaml").read_bytes()
+            bridge = ClashctlBridge(Config.load(root))
+
+            result = asyncio.run(bridge.clashctl(["fallback", "on"]))
+
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("unavailable in current subscription: removed-node", result.stderr)
+            self.assertEqual((resources / "mixin.yaml").read_bytes(), before)
+            status = asyncio.run(bridge.fallback_status())
+            self.assertIn("stale     yes (1 unavailable)", status.stdout)
+
+    def test_fallback_config_rolls_back_when_reload_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            resources = root / "resources"
+            bin_dir = root / "bin"
+            resources.mkdir()
+            bin_dir.mkdir()
+            (resources / "config.yaml").write_text(
+                "proxies:\n"
+                "  - {name: node-a, type: http, server: 127.0.0.1, port: 8080}\n"
+                "  - {name: node-b, type: http, server: 127.0.0.1, port: 8081}\n"
+                "proxy-groups:\n"
+                "  - {name: 节点选择, type: select, proxies: [node-a, node-b]}\n"
+                "rules: [MATCH,节点选择]\n"
+            )
+            (resources / "mixin.yaml").write_text(
+                "_custom:\n"
+                "  system-proxy:\n"
+                "    enable: false\n"
+            )
+            kernel = bin_dir / "mihomo"
+            kernel.write_text("#!/usr/bin/env sh\nexit 0\n")
+            kernel.chmod(0o755)
+            before = (resources / "mixin.yaml").read_bytes()
+            bridge = ClashctlBridge(Config.load(root))
+            bridge._reload_after_fallback_change = AsyncMock(  # type: ignore[method-assign]
+                side_effect=ClashctlError("restart failed")
+            )
+
+            result = asyncio.run(bridge.clashctl(["fallback", "set", "node-a", "node-b"]))
+
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("restart failed", result.stderr)
+            self.assertEqual((resources / "mixin.yaml").read_bytes(), before)
+
+    def test_subscription_switch_suspends_auto_fallback_when_runtime_is_offline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            resources = root / "resources"
+            profiles = resources / "profiles"
+            bin_dir = root / "bin"
+            resources.mkdir()
+            profiles.mkdir()
+            bin_dir.mkdir()
+            old_profile = profiles / "1.yaml"
+            new_profile = profiles / "2.yaml"
+            old_profile.write_text(
+                "proxies:\n"
+                "  - {name: old-a, type: http, server: 127.0.0.1, port: 8080}\n"
+                "  - {name: old-b, type: http, server: 127.0.0.1, port: 8081}\n"
+                "proxy-groups:\n"
+                "  - {name: 节点选择, type: select, proxies: [old-a, old-b]}\n"
+                "rules: [MATCH,节点选择]\n"
+            )
+            new_profile.write_text(
+                "proxies:\n"
+                "  - {name: new-a, type: http, server: 127.0.0.1, port: 9080}\n"
+                "  - {name: new-b, type: http, server: 127.0.0.1, port: 9081}\n"
+                "proxy-groups:\n"
+                "  - {name: 节点选择, type: select, proxies: [new-a, new-b]}\n"
+                "rules: [MATCH,节点选择]\n"
+            )
+            (resources / "config.yaml").write_bytes(old_profile.read_bytes())
+            (resources / "profiles.yaml").write_text(
+                "use: 1\n"
+                "profiles:\n"
+                f"  - {{id: 1, path: {old_profile}, url: https://one.example/sub}}\n"
+                f"  - {{id: 2, path: {new_profile}, url: https://two.example/sub}}\n"
+            )
+            (resources / "mixin.yaml").write_text(
+                "_custom:\n"
+                "  selector-group: 节点选择\n"
+                "  fallback:\n"
+                "    enable: true\n"
+                "    mode: auto\n"
+                "    size: 3\n"
+                "    nodes: [old-a, old-b]\n"
+                "rules:\n"
+                "  suffix: [MATCH,节点选择]\n"
+            )
+            kernel = bin_dir / "mihomo"
+            kernel.write_text("#!/usr/bin/env sh\nexit 0\n")
+            kernel.chmod(0o755)
+            bridge = ClashctlBridge(Config.load(root))
+            bridge._pid = lambda: None  # type: ignore[method-assign]
+
+            result = asyncio.run(bridge.sub_use(2))
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("fallback refresh deferred", result.stdout)
+            settings = yaml.safe_load((resources / "mixin.yaml").read_text())["_custom"]["fallback"]
+            self.assertFalse(settings["enable"])
+            self.assertTrue(settings["stale"])
+            self.assertTrue(settings["resume"])
+            runtime = yaml.safe_load((resources / "runtime.yaml").read_text())
+            self.assertEqual(runtime["rules"][-1], "MATCH,节点选择")
+            self.assertFalse(any(group["name"] == "ccli-fallback" for group in runtime["proxy-groups"]))
+
+    def test_subscription_switch_rebuilds_enabled_auto_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            resources = root / "resources"
+            profiles = resources / "profiles"
+            bin_dir = root / "bin"
+            resources.mkdir()
+            profiles.mkdir()
+            bin_dir.mkdir()
+            profile = profiles / "2.yaml"
+            profile.write_text(
+                "proxies:\n"
+                "  - {name: new-a, type: http, server: 127.0.0.1, port: 9080}\n"
+                "  - {name: new-b, type: http, server: 127.0.0.1, port: 9081}\n"
+                "proxy-groups:\n"
+                "  - {name: 节点选择, type: select, proxies: [new-a, new-b]}\n"
+                "rules: [MATCH,节点选择]\n"
+            )
+            (resources / "config.yaml").write_bytes(profile.read_bytes())
+            (resources / "profiles.yaml").write_text(
+                "use: 1\n"
+                "profiles:\n"
+                f"  - {{id: 2, path: {profile}, url: https://two.example/sub}}\n"
+            )
+            (resources / "mixin.yaml").write_text(
+                "secret: test-secret\n"
+                "_custom:\n"
+                "  selector-group: 节点选择\n"
+                "  fallback:\n"
+                "    enable: true\n"
+                "    mode: auto\n"
+                "    size: 4\n"
+                "    nodes: [old-a, old-b]\n"
+                "rules:\n"
+                "  suffix: [MATCH,节点选择]\n"
+            )
+            kernel = bin_dir / "mihomo"
+            kernel.write_text("#!/usr/bin/env sh\nexit 0\n")
+            kernel.chmod(0o755)
+            bridge = ClashctlBridge(Config.load(root))
+            bridge._pid = lambda: 123  # type: ignore[method-assign]
+            bridge.restart_if_running = AsyncMock()  # type: ignore[method-assign]
+            ok = UnlockStatus(claude="ok:US", chatgpt="ok:US", gemini="ok:USA")
+            bridge._refresh_auto_fallback = AsyncMock(  # type: ignore[attr-defined]
+                return_value=[
+                    Node("new-a", delay=20, unlock=ok),
+                    Node("new-b", delay=30, unlock=ok),
+                ]
+            )
+
+            result = asyncio.run(bridge.sub_use(2))
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("fallback refreshed: new-a -> new-b", result.stdout)
+            bridge._refresh_auto_fallback.assert_awaited_once_with(4, enable=True)  # type: ignore[attr-defined]
 
     def test_subconverter_port_conflict_uses_free_port(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
@@ -735,7 +1055,7 @@ class ScannerRegressionTests(unittest.TestCase):
         original_check = scanner.check_unlock
 
         async def fake_check(_proxy_url: str) -> UnlockStatus:
-            return UnlockStatus(claude="ok:US", chatgpt="ok:US", gemini="ok:USA")
+            return UnlockStatus(claude="ok:US", chatgpt="ok:US", gemini="blocked:CHN")
 
         async def run() -> None:
             scanner.check_unlock = fake_check
@@ -773,6 +1093,22 @@ class ScannerRegressionTests(unittest.TestCase):
             asyncio.run(run())
         finally:
             scanner.check_unlock = original_check
+
+
+class NodeListScreenTests(unittest.TestCase):
+    def test_node_list_screen_exposes_informed_switch_actions(self) -> None:
+        from clash_cli.app import NODE_SKIP_NAMES, NodeListScreen
+
+        for action in ("action_test_unlock", "action_test_delays", "action_refresh_list"):
+            self.assertTrue(
+                callable(getattr(NodeListScreen, action, None)),
+                f"NodeListScreen is missing {action}",
+            )
+        binding_keys = {b.key for b in NodeListScreen.BINDINGS}
+        self.assertIn("t", binding_keys)
+        self.assertIn("d", binding_keys)
+        for name in ("DIRECT", "REJECT", "自动选择", "故障转移"):
+            self.assertIn(name, NODE_SKIP_NAMES)
 
 
 if __name__ == "__main__":

@@ -19,14 +19,41 @@ import httpx
 import yaml
 
 from clash_cli.api.client import ClashApiError, ClashClient
+from clash_cli.api.models import Node
 from clash_cli.config import Config
+from clash_cli.scanner.scanner import full_scan
 
 HELP_FLAGS = {"-h", "--help"}
 URL_RE = re.compile(r"(?:https?|file)://[^\s'\"]+")
 LEGACY_DIRECT_IP_RULES = {"DOMAIN,API64.IPIFY.ORG,DIRECT"}
+AI_SELECTOR_RULES = (
+    "DOMAIN-SUFFIX,claude.ai,{selector}",
+    "DOMAIN-SUFFIX,anthropic.com,{selector}",
+    "DOMAIN-SUFFIX,chatgpt.com,{selector}",
+    "DOMAIN-SUFFIX,openai.com,{selector}",
+    "DOMAIN,gemini.google.com,{selector}",
+)
+FALLBACK_HEALTH_URL = "https://chat.openai.com/cdn-cgi/trace"
+FALLBACK_HEALTH_INTERVAL = 15
+FALLBACK_MAX_FAILED_TIMES = 1
 HTML_RESPONSE_RE = re.compile(
     r"<\s*(?:!doctype|html|head|body|title)(?:[\s>]|$)",
     re.IGNORECASE,
+)
+
+AUTO_FALLBACK_REGIONS = (
+    ("hk", ("香港", "Hong Kong", "🇭🇰")),
+    ("tw", ("台湾", "台灣", "Taiwan", "🇹🇼")),
+    ("jp", ("日本", "Japan", "🇯🇵")),
+    ("sg", ("新加坡", "狮城", "獅城", "Singapore", "🇸🇬")),
+    ("us", ("美国", "美國", "United States", "America", "🇺🇸")),
+    ("ca", ("加拿大", "Canada", "🇨🇦")),
+    ("kr", ("韩国", "韓國", "Korea", "🇰🇷")),
+    ("uk", ("英国", "英國", "United Kingdom", "Britain", "🇬🇧")),
+    ("de", ("德国", "德國", "Germany", "🇩🇪")),
+    ("fr", ("法国", "法國", "France", "🇫🇷")),
+    ("nl", ("荷兰", "荷蘭", "Netherlands", "🇳🇱")),
+    ("au", ("澳大利亚", "澳大利亞", "澳洲", "Australia", "🇦🇺")),
 )
 
 
@@ -299,7 +326,7 @@ class ClashctlBridge:
             "Commands:\n"
             "  on/off/restart/status/ui/log\n"
             "  doctor\n"
-            "  fallback [status|list|set|on|off]\n"
+            "  fallback [status|list|set|auto|refresh|on|off]\n"
             "  proxy [on|off]\n"
             "  tun [on|off]\n"
             "  mixin [-r|-c]\n"
@@ -317,8 +344,10 @@ class ClashctlBridge:
             "doctor": "Usage: ccli doctor\n\nRun local runtime, config, API, subscription, shell, and converter checks.",
             "fallback": (
                 "Usage: ccli fallback [status|list|on|off]\n"
-                "       ccli fallback set <primary> <backup> [backup...]\n\n"
-                "Configure ordered automatic failover nodes."
+                "       ccli fallback set <primary> <backup> [backup...]\n"
+                "       ccli fallback auto [--size N]\n"
+                "       ccli fallback refresh\n\n"
+                "Build a static pool, or scan the current subscription for an automatic pool."
             ),
             "ui": "Usage: ccli ui\n\nPrint the local dashboard URL.",
             "proxy": "Usage: ccli proxy [on|off]\n\nToggle or show shell proxy integration state.",
@@ -710,6 +739,7 @@ class ClashctlBridge:
 
         combined_rules = (
             list(rules_mixin.get("prefix", []) or [])
+            + [rule.format(selector=self.config.selector_group) for rule in AI_SELECTOR_RULES]
             + list(base.get("rules", []) or [])
             + list(rules_mixin.get("suffix", []) or [])
         )
@@ -750,11 +780,13 @@ class ClashctlBridge:
             "name": name,
             "type": "fallback",
             "proxies": nodes,
-            "url": str(settings.get("url", "https://www.gstatic.com/generate_204")),
-            "interval": self._fallback_int(settings, "interval", 60),
-            "lazy": True,
+            "url": str(settings.get("url", FALLBACK_HEALTH_URL)),
+            "interval": self._fallback_int(settings, "interval", FALLBACK_HEALTH_INTERVAL),
+            "lazy": False,
             "timeout": self._fallback_int(settings, "timeout", 5000),
-            "max-failed-times": self._fallback_int(settings, "max-failed-times", 2),
+            "max-failed-times": self._fallback_int(
+                settings, "max-failed-times", FALLBACK_MAX_FAILED_TIMES
+            ),
         }
         groups = runtime.setdefault("proxy-groups", [])
         groups[:] = [item for item in groups if not isinstance(item, dict) or item.get("name") != name]
@@ -776,6 +808,40 @@ class ClashctlBridge:
         if not isinstance(raw_nodes, list):
             raise ClashctlError("fallback nodes must be a list")
         return list(dict.fromkeys(str(node) for node in raw_nodes if node))
+
+    @staticmethod
+    def _fallback_region(name: str) -> str:
+        folded = name.casefold()
+        for region, aliases in AUTO_FALLBACK_REGIONS:
+            if any(alias.casefold() in folded for alias in aliases):
+                return region
+        return f"other:{folded}"
+
+    @classmethod
+    def _select_auto_fallback_nodes(cls, nodes: Sequence[Node], size: int) -> list[Node]:
+        eligible = sorted(
+            (
+                node for node in nodes
+                if node.delay is not None and node.delay > 0 and node.unlock.primary_ok
+            ),
+            key=lambda node: (node.delay or 0, node.name),
+        )
+        selected: list[Node] = []
+        seen_regions: set[str] = set()
+        for node in eligible:
+            region = cls._fallback_region(node.name)
+            if region in seen_regions:
+                continue
+            selected.append(node)
+            seen_regions.add(region)
+            if len(selected) >= size:
+                return selected
+        for node in eligible:
+            if node not in selected:
+                selected.append(node)
+            if len(selected) >= size:
+                break
+        return selected
 
     def _merge_named_list(self, base_items: list[dict[str, Any]], mixin: dict[str, Any]) -> list[dict[str, Any]]:
         overrides = {item.get("name"): item for item in mixin.get("override", []) or []}
@@ -871,19 +937,62 @@ class ClashctlBridge:
     def sub_list(self) -> ClashctlResult:
         return ClashctlResult(0, yaml.safe_dump(self._masked_profiles(), allow_unicode=True, sort_keys=False).strip())
 
+    def _suspend_auto_fallback_for_subscription(self) -> int | None:
+        mixin, _custom, settings = self._fallback_config()
+        if settings.get("mode") != "auto":
+            return None
+        resume = bool(settings.get("enable") or settings.get("resume"))
+        settings["enable"] = False
+        settings["stale"] = True
+        settings["resume"] = resume
+        _write_yaml(self.mixin_config, mixin)
+        self.config = Config.load(self.root)
+        if not resume:
+            return None
+        return self._fallback_int(settings, "size", 5)
+
     async def sub_use(self, sub_id: int) -> ClashctlResult:
         profile = self._profile_by_id(sub_id)
         path = Path(profile.get("path", "")).expanduser()
         if not path.exists():
             raise ClashctlError(f"profile file not found: {path}")
-        self.base_config.write_bytes(path.read_bytes())
-        await self.merge_config()
-        data = self._profiles()
-        data["use"] = sub_id
-        self._save_profiles(data)
-        await self.restart_if_running()
+
+        snapshots = self._snapshot_files(
+            [self.base_config, self.mixin_config, self.profiles_meta]
+        )
+        was_running = bool(self._pid())
+        refresh_size: int | None = None
+        try:
+            refresh_size = self._suspend_auto_fallback_for_subscription()
+            self.base_config.write_bytes(path.read_bytes())
+            self.config = Config.load(self.root)
+            await self.merge_config()
+            data = self._profiles()
+            data["use"] = sub_id
+            self._save_profiles(data)
+            self.config = Config.load(self.root)
+            await self.restart_if_running()
+        except Exception as error:
+            rollback_error = await self._restore_runtime_snapshot(snapshots, was_running)
+            if isinstance(error, ClashctlError) and not rollback_error:
+                raise
+            raise ClashctlError(f"{error}{rollback_error}") from error
+
         self._log_sub(f"selected subscription [{sub_id}] {mask_url(str(profile.get('url', '')))}")
-        return ClashctlResult(0, f"subscription selected: [{sub_id}]")
+        lines = [f"subscription selected: [{sub_id}]"]
+        if refresh_size is not None:
+            if not self._pid():
+                lines.append(
+                    "fallback refresh deferred: mihomo is not running; "
+                    "run ccli fallback refresh after ccli on"
+                )
+            else:
+                try:
+                    nodes = await self._refresh_auto_fallback(refresh_size, enable=True)
+                    lines.append(f"fallback refreshed: {' -> '.join(node.name for node in nodes)}")
+                except ClashctlError as error:
+                    lines.append(f"fallback remains off (stale): {error}")
+        return ClashctlResult(0, "\n".join(lines))
 
     async def sub_update(self, sub_id: int | None = None, *, force_convert: bool = False) -> ClashctlResult:
         data = self._profiles()
@@ -961,8 +1070,114 @@ class ClashctlBridge:
     async def _reload_after_fallback_change(self) -> None:
         self.config = Config.load(self.root)
         await self.merge_config()
-        if self._pid():
-            await self.restart()
+        await self.restart_if_running()
+
+    @staticmethod
+    def _snapshot_files(paths: Sequence[Path]) -> list[tuple[Path, bool, bytes]]:
+        return [
+            (path, path.exists(), path.read_bytes() if path.exists() else b"")
+            for path in paths
+        ]
+
+    async def _restore_runtime_snapshot(
+        self,
+        snapshots: Sequence[tuple[Path, bool, bytes]],
+        was_running: bool,
+    ) -> str:
+        try:
+            for path, existed, contents in snapshots:
+                if existed:
+                    path.write_bytes(contents)
+                elif path.exists():
+                    path.unlink()
+            self.config = Config.load(self.root)
+            await self.merge_config()
+            if was_running:
+                if self._pid():
+                    await self.restart_if_running()
+                else:
+                    restored = await self.on()
+                    if restored.returncode != 0:
+                        raise ClashctlError(restored.stderr or restored.stdout)
+        except Exception as error:
+            return f"; rollback failed: {error}"
+        return ""
+
+    async def _commit_fallback_config(self, mixin: dict[str, Any]) -> None:
+        snapshots = self._snapshot_files([self.mixin_config])
+        was_running = bool(self._pid())
+        try:
+            _write_yaml(self.mixin_config, mixin)
+            await self._reload_after_fallback_change()
+        except Exception as error:
+            rollback_error = await self._restore_runtime_snapshot(snapshots, was_running)
+            if isinstance(error, ClashctlError) and not rollback_error:
+                raise
+            raise ClashctlError(f"{error}{rollback_error}") from error
+
+    @staticmethod
+    def _parse_fallback_auto_size(args: Sequence[str]) -> int | ClashctlResult:
+        value = "5"
+        if not args:
+            pass
+        elif len(args) == 2 and args[0] == "--size":
+            value = args[1]
+        elif len(args) == 1 and args[0].startswith("--size="):
+            value = args[0].partition("=")[2]
+        else:
+            return ClashctlResult(2, stderr="usage: ccli fallback auto [--size N]")
+        try:
+            size = int(value)
+        except ValueError:
+            return ClashctlResult(2, stderr="fallback auto size must be an integer between 2 and 20")
+        if not 2 <= size <= 20:
+            return ClashctlResult(2, stderr="fallback auto size must be between 2 and 20")
+        return size
+
+    async def _discover_auto_fallback_nodes(self, size: int) -> list[Node]:
+        if not self._pid():
+            raise ClashctlError("mihomo is not running; run ccli on before building an automatic fallback pool")
+        self.config = Config.load(self.root)
+        if not self.config.secret:
+            raise ClashctlError("Clash API secret is not configured")
+        mixin, _custom, _settings = self._fallback_config()
+        selector = self._configured_selector_group(mixin)
+        client = ClashClient(self.config.api_base, self.config.secret)
+        try:
+            result = await full_scan(client, self.config.proxy_url, group_name=selector)
+        except Exception as error:
+            raise ClashctlError(f"automatic fallback scan failed: {error}") from error
+        selected = self._select_auto_fallback_nodes(result.nodes, size)
+        if len(selected) < 2:
+            raise ClashctlError(
+                "automatic fallback needs at least two connected nodes that unlock "
+                f"Claude and ChatGPT; found {len(selected)}"
+            )
+        return selected
+
+    async def _refresh_auto_fallback(self, size: int, *, enable: bool) -> list[Node]:
+        nodes = await self._discover_auto_fallback_nodes(size)
+        mixin, custom, settings = self._fallback_config()
+        custom.setdefault("selector-group", self._configured_selector_group(mixin))
+        settings.update(
+            {
+                "enable": enable,
+                "mode": "auto",
+                "size": size,
+                "name": "ccli-fallback",
+                "nodes": [node.name for node in nodes],
+                "source-sub": int(self._profiles().get("use", 0) or 0),
+                "updated-at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                "stale": False,
+                "url": FALLBACK_HEALTH_URL,
+                "interval": FALLBACK_HEALTH_INTERVAL,
+                "timeout": 5000,
+                "max-failed-times": FALLBACK_MAX_FAILED_TIMES,
+            }
+        )
+        settings.pop("resume", None)
+        await self._commit_fallback_config(mixin)
+        return nodes
 
     async def fallback(self, args: Sequence[str]) -> ClashctlResult:
         command = args[0] if args else "status"
@@ -985,16 +1200,35 @@ class ClashctlBridge:
             settings.update(
                 {
                     "enable": True,
+                    "mode": "static",
+                    "size": len(nodes),
                     "name": "ccli-fallback",
                     "nodes": nodes,
-                    "url": "https://www.gstatic.com/generate_204",
-                    "interval": 60,
+                    "source-sub": int(self._profiles().get("use", 0) or 0),
+                    "updated-at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                    "stale": False,
+                    "url": FALLBACK_HEALTH_URL,
+                    "interval": FALLBACK_HEALTH_INTERVAL,
                     "timeout": 5000,
-                    "max-failed-times": 2,
+                    "max-failed-times": FALLBACK_MAX_FAILED_TIMES,
                 }
             )
-            _write_yaml(self.mixin_config, mixin)
-            await self._reload_after_fallback_change()
+            settings.pop("resume", None)
+            await self._commit_fallback_config(mixin)
+            return await self.fallback_status()
+        if command == "auto":
+            parsed = self._parse_fallback_auto_size(args[1:])
+            if isinstance(parsed, ClashctlResult):
+                return parsed
+            await self._refresh_auto_fallback(parsed, enable=True)
+            return await self.fallback_status()
+        if command == "refresh" and len(args) == 1:
+            _mixin, _custom, settings = self._fallback_config()
+            if settings.get("mode") != "auto":
+                return ClashctlResult(1, stderr="automatic fallback is not configured; run ccli fallback auto")
+            size = self._fallback_int(settings, "size", 5)
+            enable = bool(settings.get("enable") or settings.get("resume"))
+            await self._refresh_auto_fallback(size, enable=enable)
             return await self.fallback_status()
         if command in ("on", "off") and len(args) == 1:
             mixin, custom, settings = self._fallback_config()
@@ -1004,15 +1238,30 @@ class ClashctlBridge:
                     1,
                     stderr="fallback is not configured; run ccli fallback set <primary> <backup> [backup...]",
                 )
+            if command == "on" and settings.get("mode") == "auto" and settings.get("stale"):
+                size = self._fallback_int(settings, "size", 5)
+                await self._refresh_auto_fallback(size, enable=True)
+                return await self.fallback_status()
+            if command == "on":
+                missing = [node for node in nodes if node not in self._available_policy_names()]
+                if missing:
+                    return ClashctlResult(
+                        1,
+                        stderr=(
+                            "fallback nodes unavailable in current subscription: "
+                            + ", ".join(missing)
+                        ),
+                    )
             custom.setdefault("selector-group", self._configured_selector_group(mixin))
             settings["enable"] = command == "on"
-            _write_yaml(self.mixin_config, mixin)
-            await self._reload_after_fallback_change()
+            settings["resume"] = False
+            await self._commit_fallback_config(mixin)
             return await self.fallback_status()
         return ClashctlResult(
             2,
             stderr=(
-                "usage: ccli fallback [status|list|on|off]\n"
+                "usage: ccli fallback [status|list|on|off|refresh]\n"
+                "       ccli fallback auto [--size N]\n"
                 "       ccli fallback set <primary> <backup> [backup...]"
             ),
         )
@@ -1022,6 +1271,14 @@ class ClashctlBridge:
         nodes = self._fallback_nodes(settings)
         enabled = bool(settings.get("enable")) and len(nodes) >= 2
         name = str(settings.get("name", "ccli-fallback"))
+        source_sub = settings.get("source-sub")
+        available = self._available_policy_names()
+        unavailable = [node for node in nodes if node not in available]
+        stale = bool(settings.get("stale") or unavailable)
+        if unavailable:
+            stale_status = f"yes ({len(unavailable)} unavailable)"
+        else:
+            stale_status = "yes" if stale else "no"
         active = "-"
         api = "offline" if not self._pid() else "not checked"
         if enabled and self._pid() and self.config.secret:
@@ -1033,11 +1290,19 @@ class ClashctlBridge:
                 api = str(e)
         rows = [
             ("fallback", "on" if enabled else "off"),
+            ("mode", str(settings.get("mode", "-"))),
             ("group", name),
             ("active", active),
             ("order", " -> ".join(nodes) if nodes else "not configured"),
-            ("check", str(settings.get("url", "https://www.gstatic.com/generate_204"))),
-            ("interval", f"{self._fallback_int(settings, 'interval', 60)}s"),
+            ("size", str(settings.get("size", len(nodes) if nodes else "-"))),
+            ("source", f"subscription #{source_sub}" if source_sub is not None else "-"),
+            ("updated", str(settings.get("updated-at", "-"))),
+            ("stale", stale_status),
+            ("check", str(settings.get("url", FALLBACK_HEALTH_URL))),
+            (
+                "interval",
+                f"{self._fallback_int(settings, 'interval', FALLBACK_HEALTH_INTERVAL)}s",
+            ),
             ("api", api),
         ]
         return ClashctlResult(0, _format_rows("clash-cli fallback", rows))
