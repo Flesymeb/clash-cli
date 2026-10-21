@@ -202,6 +202,7 @@ class ClashctlBridge:
         self.subconverter = self.subconverter_dir / "subconverter"
         self.subconverter_config = self.subconverter_dir / "pref.yml"
         self.subconverter_log = self.subconverter_dir / "latest.log"
+        self._last_userinfo = ""
 
     def _load_env(self) -> dict[str, str]:
         env_path = self.root / ".env"
@@ -470,6 +471,15 @@ class ClashctlBridge:
         with self.profiles_log.open("a") as f:
             f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} {message}\n")
 
+    def _save_traffic_userinfo(self, sub_id: int, raw: str) -> None:
+        data = self._profiles()
+        for profile in data.get("profiles", []):
+            if int(profile.get("id", -1)) == sub_id:
+                if profile.get("traffic") != raw:
+                    profile["traffic"] = raw
+                    self._save_profiles(data)
+                return
+
     def _raw_subscription_path(self, dest: Path) -> Path:
         return dest.with_name(dest.name + ".raw")
 
@@ -588,6 +598,9 @@ class ClashctlBridge:
             except httpx.HTTPError as e:
                 detail = _mask_sensitive_text(str(e))
                 raise ClashctlError(f"subscription download failed: {detail}") from e
+        userinfo = resp.headers.get("subscription-userinfo", "").strip()
+        if userinfo:
+            self._last_userinfo = userinfo
         dest.write_bytes(resp.content)
 
     async def _subconverter_ready(self, port: int) -> bool:
@@ -657,6 +670,7 @@ class ClashctlBridge:
             await self._stop_subconverter(proc)
 
     async def _download_subscription(self, url: str, dest: Path, *, force_convert: bool = False) -> None:
+        self._last_userinfo = ""
         raw_path = self._raw_subscription_path(dest)
         raw_error_text = ""
         if force_convert:
@@ -915,7 +929,10 @@ class ClashctlBridge:
         profile_path = self.profiles_dir / f"{next_id}.yaml"
         await self._download_subscription(url, self.temp_config, force_convert=force_convert)
         self.temp_config.replace(profile_path)
-        data["profiles"].append({"id": next_id, "path": str(profile_path), "url": url})
+        entry = {"id": next_id, "path": str(profile_path), "url": url}
+        if self._last_userinfo:
+            entry["traffic"] = self._last_userinfo
+        data["profiles"].append(entry)
         self._save_profiles(data)
         masked_url = mask_url(url)
         self._log_sub(f"added subscription [{next_id}] {masked_url}")
@@ -1004,6 +1021,8 @@ class ClashctlBridge:
         await self._download_subscription(url, self.temp_config, force_convert=force_convert)
         profile_path = Path(profile.get("path", "")).expanduser()
         profile_path.write_bytes(self.temp_config.read_bytes())
+        if self._last_userinfo:
+            self._save_traffic_userinfo(use_id, self._last_userinfo)
         self._log_sub(f"updated subscription [{use_id}] {mask_url(str(url))}")
         if int(data.get("use", 0)) == use_id:
             return await self.sub_use(use_id)
@@ -1599,6 +1618,63 @@ class ClashctlBridge:
             host = "127.0.0.1"
         return ClashctlResult(0, f"Dashboard: http://{host}:{port or '9090'}/ui")
 
+    GNOME_PROXY_IGNORE_HOSTS = [
+        "localhost", "127.0.0.0/8", "::1",
+        "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "*.local",
+    ]
+
+    def _gnome_set(self, schema: str, key: str, value: str) -> str | None:
+        """Run one gsettings set; return error text on failure."""
+        try:
+            proc = subprocess.run(
+                ["gsettings", "set", schema, key, value],
+                capture_output=True, text=True, timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError) as e:
+            return f"{e}"
+        if proc.returncode != 0:
+            return (proc.stderr or proc.stdout or "failed").strip()
+        return None
+
+    def _gnome_get(self, schema: str, key: str) -> str | None:
+        try:
+            proc = subprocess.run(
+                ["gsettings", "get", schema, key],
+                capture_output=True, text=True, timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if proc.returncode != 0:
+            return None
+        return proc.stdout.strip().strip("'")
+
+    def _apply_gnome_proxy(self, enabled: bool, mixin: dict[str, Any]) -> list[str]:
+        if shutil.which("gsettings") is None or os.environ.get("XDG_CURRENT_DESKTOP") is None:
+            return ["gsettings unavailable; system (GNOME) proxy not changed"]
+        lines: list[str] = []
+        prefix = "org.gnome.system.proxy"
+        if enabled:
+            port = str(mixin.get("mixed-port") or 7890)
+            for schema, key, value in [
+                (f"{prefix}.http", "host", "127.0.0.1"),
+                (f"{prefix}.http", "port", port),
+                (f"{prefix}.https", "host", "127.0.0.1"),
+                (f"{prefix}.https", "port", port),
+                (f"{prefix}.socks", "host", "127.0.0.1"),
+                (f"{prefix}.socks", "port", port),
+                (prefix, "ignore-hosts", str(self.GNOME_PROXY_IGNORE_HOSTS).replace("'", '"')),
+                (prefix, "mode", "manual"),
+            ]:
+                error = self._gnome_set(schema, key, value)
+                if error:
+                    lines.append(f"gsettings {schema} {key}: {error}")
+            if not lines:
+                lines.append(f"GNOME system proxy: manual (127.0.0.1:{port})")
+        else:
+            error = self._gnome_set(prefix, "mode", "none")
+            lines.append("GNOME system proxy: none" if not error else f"gsettings mode: {error}")
+        return lines
+
     def proxy(self, args: Sequence[str]) -> ClashctlResult:
         mixin = _load_yaml(self.mixin_config)
         custom = mixin.setdefault("_custom", {})
@@ -1607,16 +1683,18 @@ class ClashctlBridge:
             return ClashctlResult(2, stderr="usage: ccli proxy [on|off]")
         if args and args[0] not in ("on", "off"):
             return ClashctlResult(2, stderr="usage: ccli proxy [on|off]")
-        if args and args[0] == "on":
-            system_proxy["enable"] = True
+        if args and args[0] in ("on", "off"):
+            enabled = args[0] == "on"
+            system_proxy["enable"] = enabled
             _write_yaml(self.mixin_config, mixin)
-            return ClashctlResult(0, 'proxy flag enabled; run eval "$(ccli env)" in this shell')
-        if args and args[0] == "off":
-            system_proxy["enable"] = False
-            _write_yaml(self.mixin_config, mixin)
-            return ClashctlResult(0, 'proxy flag disabled; run eval "$(ccli env --unset)" in this shell')
+            lines = self._apply_gnome_proxy(enabled, mixin)
+            if enabled:
+                lines.append('shell env for new terminals is set via ~/.zshenv; '
+                             'current shell: eval "$(ccli env)"')
+            return ClashctlResult(0, "\n".join(lines))
         state = "on" if system_proxy.get("enable") else "off"
-        return ClashctlResult(0, f"proxy flag: {state}")
+        gnome_mode = self._gnome_get("org.gnome.system.proxy", "mode")
+        return ClashctlResult(0, f"proxy flag: {state}  (GNOME system proxy: {gnome_mode or 'unknown'})")
 
     async def tun(self, args: Sequence[str]) -> ClashctlResult:
         mixin = _load_yaml(self.mixin_config)

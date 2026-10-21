@@ -3,10 +3,82 @@
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 import yaml
+
+_GB = 2**30
+
+
+@dataclass(frozen=True)
+class TrafficInfo:
+    """Parsed ``Subscription-Userinfo`` header from a subscription provider."""
+
+    upload: int = 0
+    download: int = 0
+    total: int = 0
+    expire: int = 0  # unix seconds; 0 when unknown
+
+    @classmethod
+    def parse(cls, raw: str | None) -> TrafficInfo | None:
+        if not raw:
+            return None
+        values: dict[str, int] = {}
+        for part in raw.split(";"):
+            key, sep, value = part.strip().partition("=")
+            if not sep:
+                continue
+            try:
+                values[key.strip().lower()] = int(value.strip())
+            except ValueError:
+                continue
+        if not values:
+            return None
+        return cls(
+            upload=values.get("upload", 0),
+            download=values.get("download", 0),
+            total=values.get("total", 0),
+            expire=values.get("expire", 0),
+        )
+
+    @property
+    def used(self) -> int:
+        return self.upload + self.download
+
+    @property
+    def used_gb(self) -> float:
+        return self.used / _GB
+
+    @property
+    def total_gb(self) -> float | None:
+        return self.total / _GB if self.total > 0 else None
+
+    @property
+    def remaining_gb(self) -> float | None:
+        if self.total <= 0:
+            return None
+        return max(self.total - self.used, 0) / _GB
+
+    @property
+    def percent_used(self) -> int | None:
+        if self.total <= 0:
+            return None
+        return min(round(self.used * 100 / self.total), 100)
+
+    @property
+    def expire_date(self) -> str | None:
+        if self.expire <= 0:
+            return None
+        return datetime.fromtimestamp(self.expire).strftime("%Y-%m-%d")
+
+    @property
+    def days_left(self) -> int | None:
+        if self.expire <= 0:
+            return None
+        return max((self.expire - int(time.time())) // 86400, 0)
 
 
 @dataclass
@@ -26,6 +98,7 @@ class Config:
     clashctl_dir: Path = field(default_factory=lambda: Path.home() / "clashctl")
     subscriptions: list[Subscription] = field(default_factory=list)
     current_sub_id: int = 0
+    traffic: TrafficInfo | None = None
     config_errors: list[str] = field(default_factory=list)
 
     @classmethod
@@ -114,6 +187,8 @@ class Config:
                             is_current=p.get("id") == cfg.current_sub_id,
                         )
                     )
+                    if p.get("id") == cfg.current_sub_id and p.get("traffic"):
+                        cfg.traffic = TrafficInfo.parse(str(p["traffic"]))
             except Exception as e:
                 cfg.config_errors.append(f"{profiles_path}: {e}")
 

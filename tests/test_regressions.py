@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import socket
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1123,6 +1124,237 @@ class NodeListScreenTests(unittest.TestCase):
         )
         self.assertEqual(result.stdout.strip(), "False",
                          "importing clash_cli.app must not pull in textual")
+
+
+class NodeFilterTests(unittest.TestCase):
+    def test_info_node_detection(self) -> None:
+        from clash_cli.api.models import is_info_node
+
+        info_nodes = [
+            "剩余流量：87.37 GB",
+            "距离下次重置剩余：26 天",
+            "套餐到期：2026-11-16",
+            "🍃美国🇺🇸|官网:app.miaonetwork.com",
+            "🍃美国🇺🇸|20%循环佣金满150￥月结速速行动吧!",
+            "🍃香港🇭🇰|不会使用请查看教程",
+            "🍃香港🇭🇰|付费解锁60+节点",
+        ]
+        for name in info_nodes:
+            self.assertTrue(is_info_node(name), f"should filter: {name}")
+
+        real_nodes = [
+            "🌿香港🇭🇰04",
+            "⚡日本🇯🇵|AI专用|限速30M",
+            "💎挪威🇳🇴01",
+            "🌿新加坡🇸🇬04",
+            "⚡香港🇭🇰11|0.1",
+        ]
+        for name in real_nodes:
+            self.assertFalse(is_info_node(name), f"should keep: {name}")
+
+    def test_blocked_region_detection(self) -> None:
+        from clash_cli.api.models import is_blocked_region
+
+        self.assertTrue(is_blocked_region("🌿香港🇭🇰04"))
+        self.assertTrue(is_blocked_region("⚡香港🇭🇰11|0.1"))
+        self.assertFalse(is_blocked_region("🌿新加坡🇸🇬04"))
+        self.assertFalse(is_blocked_region("💎挪威🇳🇴01"))
+
+
+class TrafficInfoTests(unittest.TestCase):
+    def test_parse_full_header(self) -> None:
+        from clash_cli.config import TrafficInfo
+
+        raw = "upload=107603678560; download=77768638130; total=279172874240; expire=1794761926"
+        info = TrafficInfo.parse(raw)
+        self.assertIsNotNone(info)
+        assert info is not None
+        self.assertEqual(info.upload, 107603678560)
+        self.assertEqual(info.download, 77768638130)
+        self.assertEqual(info.total, 279172874240)
+        self.assertEqual(info.expire, 1794761926)
+        # Provider dashboard reports 87.37 GB remaining for these numbers.
+        self.assertAlmostEqual(info.remaining_gb, 87.37, places=1)
+        self.assertEqual(info.percent_used, 66)
+        self.assertEqual(info.expire_date, "2026-11-16")
+
+    def test_parse_partial_and_invalid(self) -> None:
+        from clash_cli.config import TrafficInfo
+
+        partial = TrafficInfo.parse("upload=100; download=200")
+        self.assertIsNotNone(partial)
+        assert partial is not None
+        self.assertEqual(partial.used, 300)
+        self.assertIsNone(partial.remaining_gb)
+        self.assertIsNone(partial.total_gb)
+        self.assertIsNone(partial.percent_used)
+        self.assertIsNone(partial.expire_date)
+        self.assertIsNone(partial.days_left)
+
+        self.assertIsNone(TrafficInfo.parse(""))
+        self.assertIsNone(TrafficInfo.parse(None))
+        self.assertIsNone(TrafficInfo.parse("garbage"))
+
+    def test_config_loads_traffic_for_current_sub(self) -> None:
+        import tempfile
+
+        from clash_cli.config import Config
+
+        with tempfile.TemporaryDirectory() as tmp:
+            resources = Path(tmp) / "resources"
+            resources.mkdir()
+            (resources / "mixin.yaml").write_text(
+                "mixed-port: 7890\nexternal-controller: 127.0.0.1:9090\nsecret: s\n"
+            )
+            (resources / "profiles.yaml").write_text(yaml.safe_dump({
+                "use": 8,
+                "profiles": [
+                    {"id": 3, "path": "/tmp/3.yaml", "url": "https://x/3"},
+                    {
+                        "id": 8,
+                        "path": "/tmp/8.yaml",
+                        "url": "https://x/8",
+                        "traffic": "upload=1; download=2; total=10; expire=1794761926",
+                    },
+                ],
+            }))
+            cfg = Config.load(Path(tmp))
+            self.assertIsNotNone(cfg.traffic)
+            assert cfg.traffic is not None
+            self.assertEqual(cfg.traffic.total, 10)
+
+            # Non-current subscription traffic must not leak in.
+            data = yaml.safe_load((resources / "profiles.yaml").read_text())
+            data["use"] = 3
+            (resources / "profiles.yaml").write_text(yaml.safe_dump(data))
+            cfg = Config.load(Path(tmp))
+            self.assertIsNone(cfg.traffic)
+
+
+class SubscriptionUserinfoCaptureTests(unittest.TestCase):
+    def test_raw_download_captures_userinfo(self) -> None:
+        import httpx
+
+        class FakeResponse:
+            def __init__(self) -> None:
+                self.headers = httpx.Headers(
+                    {"subscription-userinfo": "upload=1; download=2; total=3; expire=4"}
+                )
+                self.content = b"proxies: []\n"
+
+            def raise_for_status(self) -> None:
+                return None
+
+        class FakeClientCtx:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def get(self, url, headers=None):
+                return FakeResponse()
+
+        def fake_async_client(*args, **kwargs):
+            return FakeClientCtx()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = ClashctlBridge.__new__(ClashctlBridge)
+            bridge.env = {}
+            bridge._last_userinfo = ""
+            dest = Path(tmp) / "sub.yaml"
+
+            async def run() -> None:
+                with patch.object(httpx, "AsyncClient", fake_async_client):
+                    await bridge._download_raw_subscription("https://example.com/sub", dest)
+
+            asyncio.run(run())
+            self.assertEqual(bridge._last_userinfo, "upload=1; download=2; total=3; expire=4")
+            self.assertEqual(dest.read_bytes(), b"proxies: []\n")
+
+    def test_save_traffic_userinfo_updates_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = ClashctlBridge.__new__(ClashctlBridge)
+            bridge.profiles_meta = Path(tmp) / "profiles.yaml"
+            _write_yaml(bridge.profiles_meta, {
+                "use": 8,
+                "profiles": [{"id": 8, "path": "/tmp/8.yaml", "url": "https://x/8"}],
+            })
+            bridge._save_traffic_userinfo(8, "upload=1; download=2; total=3; expire=4")
+            data = yaml.safe_load(bridge.profiles_meta.read_text())
+            self.assertEqual(data["profiles"][0]["traffic"], "upload=1; download=2; total=3; expire=4")
+
+            # Idempotent: same value must not rewrite the file.
+            before = bridge.profiles_meta.stat().st_mtime_ns
+            bridge._save_traffic_userinfo(8, "upload=1; download=2; total=3; expire=4")
+            self.assertEqual(bridge.profiles_meta.stat().st_mtime_ns, before)
+
+            # Unknown id is a no-op.
+            bridge._save_traffic_userinfo(99, "upload=9")
+            data = yaml.safe_load(bridge.profiles_meta.read_text())
+            self.assertEqual(len(data["profiles"]), 1)
+
+
+class SystemProxyTests(unittest.TestCase):
+    def _make_bridge(self, tmp: str) -> ClashctlBridge:
+        bridge = ClashctlBridge.__new__(ClashctlBridge)
+        bridge.mixin_config = Path(tmp) / "mixin.yaml"
+        _write_yaml(bridge.mixin_config, {"mixed-port": 7890})
+        return bridge
+
+    def test_proxy_on_sets_gnome_manual(self) -> None:
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = self._make_bridge(tmp)
+            with patch.object(subprocess, "run", fake_run), \
+                 patch.object(shutil, "which", lambda name: "/usr/bin/gsettings" if name == "gsettings" else None), \
+                 patch.dict(os.environ, {"XDG_CURRENT_DESKTOP": "GNOME"}):
+                result = bridge.proxy(["on"])
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            sets = {(c[2], c[3], c[4]) for c in calls if c[1] == "set"}
+            self.assertIn(("org.gnome.system.proxy", "mode", "manual"), sets)
+            self.assertIn(("org.gnome.system.proxy.http", "port", "7890"), sets)
+            self.assertIn(("org.gnome.system.proxy.https", "port", "7890"), sets)
+            self.assertIn(("org.gnome.system.proxy.socks", "port", "7890"), sets)
+            # mode must be set last so host/port are ready before manual activates
+            self.assertEqual(calls[-1], ["gsettings", "set", "org.gnome.system.proxy", "mode", "manual"])
+            # flag persisted in mixin
+            import yaml as _yaml
+            mixin = _yaml.safe_load(Path(bridge.mixin_config).read_text())
+            self.assertTrue(mixin["_custom"]["system-proxy"]["enable"])
+
+    def test_proxy_off_sets_gnome_none(self) -> None:
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = self._make_bridge(tmp)
+            with patch.object(subprocess, "run", fake_run), \
+                 patch.object(shutil, "which", lambda name: "/usr/bin/gsettings" if name == "gsettings" else None), \
+                 patch.dict(os.environ, {"XDG_CURRENT_DESKTOP": "GNOME"}):
+                result = bridge.proxy(["off"])
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            ["gsettings", "set", "org.gnome.system.proxy", "mode", "none"], calls
+        )
+
+    def test_proxy_headless_is_graceful(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = self._make_bridge(tmp)
+            with patch.object(shutil, "which", lambda name: None):
+                result = bridge.proxy(["on"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("gsettings unavailable", result.output)
 
 
 if __name__ == "__main__":

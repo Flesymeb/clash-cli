@@ -25,7 +25,7 @@ from textual.widgets import (
 )
 
 from clash_cli.api.client import ClashClient
-from clash_cli.api.models import UnlockStatus
+from clash_cli.api.models import UnlockStatus, is_info_node
 from clash_cli.app import (
     COLOR_CYAN,
     COLOR_DIM,
@@ -90,6 +90,7 @@ class MainScreen(Screen):
         self.client = client
         self._watching = False
         self._watch_timer: asyncio.Task | None = None
+        self._refresh_on_resume = False
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -167,8 +168,7 @@ class MainScreen(Screen):
             current = f"Error: {e}"
             unlock = UnlockStatus()
 
-        status = self.query_one("#status-box", Static)
-        status.update(
+        text = (
             f"[bold]clash-cli[/bold]  "
             f"group=[{COLOR_CYAN}]{self.config.selector_group}[/{COLOR_CYAN}]  "
             f"node=[{COLOR_CYAN}]{current}[/{COLOR_CYAN}]  "
@@ -179,6 +179,39 @@ class MainScreen(Screen):
             f"ChatGPT: {color_unlock(unlock.chatgpt)}  "
             f"Gemini: {color_unlock(unlock.gemini)}"
         )
+
+        traffic = self.config.traffic
+        if traffic is not None:
+            parts = []
+            if traffic.remaining_gb is not None and traffic.total_gb is not None:
+                parts.append(
+                    f"{traffic.remaining_gb:.1f}GB left / {traffic.total_gb:.1f}GB"
+                    f" ({traffic.percent_used}% used)"
+                )
+            if traffic.expire_date:
+                days = traffic.days_left
+                parts.append(
+                    f"expires {traffic.expire_date}" + (f" ({days}d)" if days is not None else "")
+                )
+            if parts:
+                text += "\nTraffic  " + "  ".join(parts)
+
+        self.query_one("#status-box", Static).update(text)
+
+    def on_screen_suspend(self) -> None:
+        self._refresh_on_resume = True
+
+    async def on_screen_resume(self) -> None:
+        if not self._refresh_on_resume:
+            return
+        self._refresh_on_resume = False
+        # Sub-screens may have replaced app-level config/client (subscription
+        # switch); re-sync before refreshing so the home screen shows truth.
+        app = self.app
+        if isinstance(app, ClashApp):
+            self.config = app.config
+            self.client = app.client
+        await self.refresh_status()
 
     def action_show_help(self) -> None:
         self.app.push_screen(HelpScreen())
@@ -340,7 +373,10 @@ class NodeListScreen(Screen):
         try:
             group = await self.client.get_group(self.config.selector_group)
             self._group_type = group.group_type
-            self._node_list = [n for n in group.nodes if n not in NODE_SKIP_NAMES]
+            self._node_list = [
+                n for n in group.nodes
+                if n not in NODE_SKIP_NAMES and not is_info_node(n)
+            ]
             try:
                 chain = await self.client.get_proxy_chain(self.config.selector_group)
                 self._current_node = chain[-1]
@@ -462,12 +498,59 @@ class NodeListScreen(Screen):
             detail = f": {self.client.last_error}" if self.client.last_error else ""
             self.notify(f"Failed to switch to: {name}{detail}", severity="error", timeout=6)
             return
-        old = self._current_node
-        self._current_node = name
-        self._refresh_marker(old)
-        self._refresh_marker(name)
-        self._render_header()
-        self.notify(f"Switched to: {name}", severity="information", timeout=3)
+        # Re-fetch the real current node from the API instead of assuming it
+        # matches the requested name (fallback group or name ambiguity can
+        # cause Clash to land on a different node). Then reload the whole
+        # list so the marker always reflects truth.
+        try:
+            chain = await self.client.get_proxy_chain(self.config.selector_group)
+            real = chain[-1] if chain else name
+        except Exception:
+            real = name
+        self._current_node = real
+        await self._load_nodes()
+        asyncio.create_task(self._post_switch_measure(real))
+
+    async def _measure_delay(self, name: str) -> int:
+        delay = await self.client.test_delay(name)
+        self._delays[name] = delay
+        try:
+            table = self.query_one("#node-table", DataTable)
+            table.update_cell(name, "Latency", Text.from_markup(color_delay(delay)))
+        except Exception:
+            pass
+        return delay
+
+    async def _measure_current_unlock(self, name: str) -> UnlockStatus:
+        """Check unlock through the selector as currently set; update name's row."""
+        unlock = await check_unlock(self.config.proxy_url)
+        self._unlocks[name] = unlock
+        table = self.query_one("#node-table", DataTable)
+        for col, field in (("Claude", "claude"), ("ChatGPT", "chatgpt"), ("Gemini", "gemini")):
+            try:
+                table.update_cell(name, col, self._unlock_text(unlock, field))
+            except Exception:
+                pass
+        return unlock
+
+    async def _post_switch_measure(self, name: str) -> None:
+        self._testing_unlock = True
+        self._set_status(f"Testing {name}...")
+        try:
+            delay = await self._measure_delay(name)
+            unlock = await self._measure_current_unlock(name)
+            delay_text = f"{delay}ms" if delay > 0 else "timeout"
+            self.notify(
+                f"Switched to: {name} ({delay_text})  "
+                f"Claude:{unlock.claude} ChatGPT:{unlock.chatgpt} Gemini:{unlock.gemini}",
+                severity="information" if unlock.primary_ok else "warning",
+                timeout=5,
+            )
+        except Exception:
+            self.notify(f"Switched to: {name}", severity="information", timeout=3)
+        finally:
+            self._testing_unlock = False
+            self._set_status("")
 
     def _refresh_marker(self, name: str) -> None:
         if not name or name not in self._node_list:
@@ -504,16 +587,10 @@ class NodeListScreen(Screen):
                 self.notify(f"Failed to switch to {name}", severity="error", timeout=6)
                 return
             await asyncio.sleep(0.3)
-            unlock = await check_unlock(self.config.proxy_url)
-            self._unlocks[name] = unlock
-            table = self.query_one("#node-table", DataTable)
-            for col, field in (("Claude", "claude"), ("ChatGPT", "chatgpt"), ("Gemini", "gemini")):
-                try:
-                    table.update_cell(name, col, self._unlock_text(unlock, field))
-                except Exception:
-                    pass
+            delay = await self._measure_delay(name)
+            unlock = await self._measure_current_unlock(name)
             self.notify(
-                f"{name}: Claude {unlock.claude} | ChatGPT {unlock.chatgpt} | Gemini {unlock.gemini}",
+                f"{name}: {delay}ms | Claude {unlock.claude} | ChatGPT {unlock.chatgpt} | Gemini {unlock.gemini}",
                 severity="information" if unlock.primary_ok else "warning",
                 timeout=5,
             )
@@ -754,7 +831,7 @@ class HelpScreen(Screen):
   [bold]h / ?[/]     This help
 
 [bold]Node List[/]
-  [bold]Enter[/]     Switch to selected node
+  [bold]Enter[/]     Switch to selected node (auto-tests delay + unlock)
   [bold]t[/]         Test unlock on selected node
   [bold]d[/]         Test delays for all nodes
   [bold]r[/]         Refresh node list

@@ -11,7 +11,7 @@ from pathlib import Path
 
 from clash_cli import __version__
 from clash_cli.api.client import ClashClient, ClashApiError
-from clash_cli.api.models import Node, UnlockStatus
+from clash_cli.api.models import Node, UnlockStatus, is_info_node
 from clash_cli.checker.unlock import check_all as check_unlock
 from clash_cli.clashctl import ClashctlBridge, ClashctlError, ClashctlResult, mask_url
 from clash_cli.config import Config
@@ -29,11 +29,13 @@ CLASHCTL_COMMANDS = (
     "proxy", "tun", "mixin", "secret", "upgrade",
 )
 # Pseudo-entries that are not real switchable proxy nodes.
-NODE_SKIP_NAMES = frozenset({
-    "DIRECT", "REJECT", "PASS", "REJECT-DROP",
-    "自动节点", "故障节点", "故障转移", "自动选择",
-})
-
+from clash_cli.api.models import (
+    NODE_SKIP_NAMES,
+    Node,
+    UnlockStatus,
+    is_blocked_region,
+    is_info_node,
+)
 
 def clean_output(text: str) -> str:
     return ANSI_RE.sub("", text).strip()
@@ -124,7 +126,13 @@ async def resolve_switch_target(client: ClashClient, group_name: str, requested:
         raise RuntimeError("fallback controls node selection; run ccli fallback off before manual switching")
     if requested:
         return requested, "manual"
-    candidates = [name for name in group.nodes if name != group.current]
+    candidates = [
+        name for name in group.nodes
+        if name != group.current
+        and name not in NODE_SKIP_NAMES
+        and not is_info_node(name)
+        and not is_blocked_region(name)
+    ]
     if not candidates:
         candidates = list(group.nodes)
     if not candidates:

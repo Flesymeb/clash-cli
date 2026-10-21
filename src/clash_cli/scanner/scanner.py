@@ -7,7 +7,13 @@ import random
 from dataclasses import dataclass
 
 from clash_cli.api.client import ClashClient
-from clash_cli.api.models import Node, UnlockStatus
+from clash_cli.api.models import (
+    NODE_SKIP_NAMES,
+    Node,
+    UnlockStatus,
+    is_blocked_region,
+    is_info_node,
+)
 from clash_cli.checker.unlock import check_all as check_unlock
 
 
@@ -48,7 +54,12 @@ async def quick_scan(
     group = await client.get_group(group_name)
     if group.group_type.lower() == "fallback":
         raise RuntimeError("fallback controls node selection; run ccli fallback off before scanning")
-    nodes = group.nodes
+    nodes = [
+        n for n in group.nodes
+        if n not in NODE_SKIP_NAMES
+        and not is_info_node(n)
+        and not is_blocked_region(n)
+    ]
     original = group.current
 
     sample = random.sample(nodes, min(sample_size, len(nodes)))
@@ -97,7 +108,12 @@ async def full_scan(
     group = await client.get_group(group_name)
     if group.group_type.lower() == "fallback":
         raise RuntimeError("fallback controls node selection; run ccli fallback off before scanning")
-    nodes = group.nodes
+    nodes = [
+        n for n in group.nodes
+        if n not in NODE_SKIP_NAMES
+        and not is_info_node(n)
+        and not is_blocked_region(n)
+    ]
     original = group.current
 
     sem = asyncio.Semaphore(12)
