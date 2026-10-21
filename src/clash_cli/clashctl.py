@@ -1655,6 +1655,11 @@ class ClashctlBridge:
         prefix = "org.gnome.system.proxy"
         if enabled:
             port = str(mixin.get("mixed-port") or 7890)
+            custom = mixin.get("_custom", {})
+            system_proxy = custom.get("system-proxy", {}) if isinstance(custom, dict) else {}
+            hosts = system_proxy.get("ignore-hosts") if isinstance(system_proxy, dict) else None
+            if not (isinstance(hosts, list) and hosts):
+                hosts = self.GNOME_PROXY_IGNORE_HOSTS
             for schema, key, value in [
                 (f"{prefix}.http", "host", "127.0.0.1"),
                 (f"{prefix}.http", "port", port),
@@ -1662,7 +1667,7 @@ class ClashctlBridge:
                 (f"{prefix}.https", "port", port),
                 (f"{prefix}.socks", "host", "127.0.0.1"),
                 (f"{prefix}.socks", "port", port),
-                (prefix, "ignore-hosts", str(self.GNOME_PROXY_IGNORE_HOSTS).replace("'", '"')),
+                (prefix, "ignore-hosts", str(hosts).replace("'", '"')),
                 (prefix, "mode", "manual"),
             ]:
                 error = self._gnome_set(schema, key, value)

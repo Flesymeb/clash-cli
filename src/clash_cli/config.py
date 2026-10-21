@@ -12,6 +12,15 @@ import yaml
 
 _GB = 2**30
 
+# Default direct/bypass list: loopback + RFC1918 LAN. Override via mixin
+# `_custom.system-proxy.ignore-hosts` (wildcard form "*.domain" — also valid
+# for GNOME/Chromium proxy bypass rules).
+DEFAULT_NO_PROXY_HOSTS = [
+    "localhost", "127.0.0.0/8", "::1",
+    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+    "*.local",
+]
+
 
 @dataclass(frozen=True)
 class TrafficInfo:
@@ -99,6 +108,7 @@ class Config:
     subscriptions: list[Subscription] = field(default_factory=list)
     current_sub_id: int = 0
     traffic: TrafficInfo | None = None
+    no_proxy_hosts: list[str] = field(default_factory=lambda: list(DEFAULT_NO_PROXY_HOSTS))
     config_errors: list[str] = field(default_factory=list)
 
     @classmethod
@@ -155,6 +165,15 @@ class Config:
                 if isinstance(custom, dict):
                     if custom.get("selector-group"):
                         cfg.selector_group = str(custom["selector-group"])
+                    system_proxy = custom.get("system-proxy", {})
+                    if isinstance(system_proxy, dict):
+                        hosts = system_proxy.get("ignore-hosts")
+                        if (
+                            isinstance(hosts, list)
+                            and hosts
+                            and all(isinstance(h, str) and h.strip() for h in hosts)
+                        ):
+                            cfg.no_proxy_hosts = [h.strip() for h in hosts]
                     fallback = custom.get("fallback", {})
                     fallback_nodes = fallback.get("nodes", []) if isinstance(fallback, dict) else []
                     if (

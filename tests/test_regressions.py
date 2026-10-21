@@ -1357,5 +1357,40 @@ class SystemProxyTests(unittest.TestCase):
         self.assertIn("gsettings unavailable", result.output)
 
 
+class NoProxyHostsTests(unittest.TestCase):
+    def test_wildcard_hosts_converted_for_env(self) -> None:
+        from clash_cli.app import _no_proxy_env_value
+
+        value = _no_proxy_env_value(["localhost", "*.pjlab.org.cn", "pjlab.org.cn", "10.0.0.0/8"])
+        self.assertEqual(value, "localhost,.pjlab.org.cn,pjlab.org.cn,10.0.0.0/8")
+
+    def test_proxy_exports_uses_configured_hosts(self) -> None:
+        from clash_cli.app import proxy_exports
+        from clash_cli.config import Config
+
+        cfg = Config(no_proxy_hosts=["localhost", "*.pjlab.org.cn", "10.0.0.0/8"])
+        out = proxy_exports(cfg)
+        self.assertIn("no_proxy='localhost,.pjlab.org.cn,10.0.0.0/8'", out)
+
+    def test_config_reads_ignore_hosts_from_mixin(self) -> None:
+        from clash_cli.config import Config
+
+        with tempfile.TemporaryDirectory() as tmp:
+            resources = Path(tmp) / "resources"
+            resources.mkdir()
+            (resources / "mixin.yaml").write_text(yaml.safe_dump({
+                "mixed-port": 7890,
+                "secret": "s",
+                "_custom": {
+                    "system-proxy": {
+                        "enable": True,
+                        "ignore-hosts": ["localhost", "10.0.0.0/8", "*.pjlab.org.cn"],
+                    }
+                },
+            }))
+            cfg = Config.load(Path(tmp))
+            self.assertEqual(cfg.no_proxy_hosts, ["localhost", "10.0.0.0/8", "*.pjlab.org.cn"])
+
+
 if __name__ == "__main__":
     unittest.main()

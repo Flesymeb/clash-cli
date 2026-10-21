@@ -57,9 +57,16 @@ def format_delay_plain(delay: int) -> str:
     return f"{delay}ms" if delay > 0 else "timeout"
 
 
+def _no_proxy_env_value(hosts: list[str]) -> str:
+    # no_proxy has no wildcards (dot-boundary suffix matching):
+    # "*.domain" -> ".domain"; a bare apex entry should exist alongside.
+    parts = ["." + h[2:] if h.startswith("*.") else h for h in hosts]
+    return ",".join(dict.fromkeys(parts))
+
+
 def proxy_exports(config: Config) -> str:
     proxy = config.proxy_url
-    no_proxy = "localhost,127.0.0.1,::1"
+    no_proxy = _no_proxy_env_value(config.no_proxy_hosts)
     return "\n".join(
         [
             f"export http_proxy={sh_quote(proxy)}",
