@@ -245,14 +245,18 @@ async def cli_status(no_check: bool = False, timeout: float = 10.0):
     else:
         check_timeout = max(timeout, 0.1)
         try:
-            unlock = await asyncio.wait_for(check_unlock(config.proxy_url), timeout=check_timeout)
+            unlock = await asyncio.wait_for(
+                check_unlock(config.proxy_url, gemini=config.check_gemini),
+                timeout=check_timeout,
+            )
             rows.extend(
                 [
                     ("Claude region", unlock.claude),
-                    ("ChatGPT region", unlock.chatgpt),
-                    ("Gemini region", unlock.gemini),
+                    ("Codex region", unlock.chatgpt),
                 ]
             )
+            if unlock.gemini:
+                rows.append(("Gemini region", unlock.gemini))
         except asyncio.TimeoutError:
             rows.append(("unlock", f"timeout after {check_timeout:g}s"))
         except Exception as e:
@@ -266,18 +270,25 @@ async def cli_scan(full: bool = False):
     client = ClashClient(config.api_base, config.secret)
     try:
         if full:
-            result = await full_scan(client, config.proxy_url, group_name=config.selector_group)
+            result = await full_scan(
+                client, config.proxy_url, group_name=config.selector_group,
+                gemini=config.check_gemini,
+            )
         else:
-            result = await quick_scan(client, config.proxy_url, group_name=config.selector_group)
+            result = await quick_scan(
+                client, config.proxy_url, group_name=config.selector_group,
+                gemini=config.check_gemini,
+            )
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
     for node in result.nodes:
         marker = " → " if node.name == (result.best and result.best.name) else "   "
         d = f"{node.delay}ms" if node.delay and node.delay > 0 else "timeout"
-        print(f"{marker}{node.name:<20}  {d:<8}  Claude:{node.unlock.claude}  ChatGPT:{node.unlock.chatgpt}  Gemini:{node.unlock.gemini}")
+        gemini_part = f"  Gemini:{node.unlock.gemini}" if node.unlock.gemini else ""
+        print(f"{marker}{node.name:<20}  {d:<8}  Claude:{node.unlock.claude}  Codex:{node.unlock.chatgpt}{gemini_part}")
     if result.best:
-        print(f"\nFound: {result.best.name} ({result.best.delay}ms, Claude and ChatGPT available)")
+        print(f"\nFound: {result.best.name} ({result.best.delay}ms, Claude and Codex available)")
     else:
         print("\nNo fully unlocked node found")
 
@@ -304,15 +315,17 @@ async def cli_switch(node: str | None = None):
         ]
         try:
             unlock = await asyncio.wait_for(
-                check_unlock(config.proxy_url, use_cache=False), timeout=10
+                check_unlock(config.proxy_url, use_cache=False, gemini=config.check_gemini),
+                timeout=10,
             )
             rows.extend(
                 [
                     ("Claude region", unlock.claude),
-                    ("ChatGPT region", unlock.chatgpt),
-                    ("Gemini region", unlock.gemini),
+                    ("Codex region", unlock.chatgpt),
                 ]
             )
+            if unlock.gemini:
+                rows.append(("Gemini region", unlock.gemini))
         except asyncio.TimeoutError:
             rows.append(("unlock", "timeout after 10s"))
         except Exception as e:
@@ -570,11 +583,12 @@ async def cli_watch(interval: int = 120, once: bool = False):
         """Return True if node is ok, False if we had to switch."""
         try:
             current = await client.get_current_node(config.selector_group)
-            unlock = await check_unlock(config.proxy_url, use_cache=False)
+            unlock = await check_unlock(config.proxy_url, use_cache=False, gemini=config.check_gemini)
+            gemini_part = f" Gemini:{unlock.gemini}" if unlock.gemini else ""
             if unlock.primary_ok:
-                print(f"[ok] {current} Claude:{unlock.claude} ChatGPT:{unlock.chatgpt} Gemini:{unlock.gemini}")
+                print(f"[ok] {current} Claude:{unlock.claude} Codex:{unlock.chatgpt}{gemini_part}")
                 return True
-            print(f"[FAIL] {current} Claude:{unlock.claude} ChatGPT:{unlock.chatgpt} Gemini:{unlock.gemini}")
+            print(f"[FAIL] {current} Claude:{unlock.claude} Codex:{unlock.chatgpt}{gemini_part}")
         except ClashApiError as e:
             # API 不可达 → 多半 mihomo 挂了,尝试自愈拉起,不继续 scan(API 都不通 scan 也无意义)
             print(f"[ERR] API unreachable: {e}")

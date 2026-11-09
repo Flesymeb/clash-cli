@@ -127,16 +127,20 @@ class MainScreen(Screen):
             if not self._watching:
                 break
             try:
-                unlock = await check_unlock(self.config.proxy_url)
+                unlock = await check_unlock(
+                    self.config.proxy_url, gemini=self.config.check_gemini
+                )
                 if not unlock.primary_ok:
+                    gemini_part = f" Gemini:{unlock.gemini}" if unlock.gemini else ""
                     self.notify(
-                        f"Node failed! Claude:{unlock.claude} ChatGPT:{unlock.chatgpt} Gemini:{unlock.gemini}",
+                        f"Node failed! Claude:{unlock.claude} Codex:{unlock.chatgpt}{gemini_part}",
                         severity="error",
                     )
                     self.notify("Auto-scanning for working node...", severity="warning", timeout=5)
                     result = await quick_scan(
                         self.client, self.config.proxy_url,
                         group_name=self.config.selector_group,
+                        gemini=self.config.check_gemini,
                     )
                     if result.best:
                         self.notify(
@@ -164,11 +168,16 @@ class MainScreen(Screen):
     async def refresh_status(self) -> None:
         try:
             current = await self.client.get_current_node(self.config.selector_group)
-            unlock = await check_unlock(self.config.proxy_url)
+            unlock = await check_unlock(
+                self.config.proxy_url, gemini=self.config.check_gemini
+            )
         except Exception as e:
             current = f"Error: {e}"
             unlock = UnlockStatus()
 
+        gemini_part = (
+            f"  Gemini: {color_unlock(unlock.gemini)}" if unlock.gemini else ""
+        )
         text = (
             f"[bold]clash-cli[/bold]  "
             f"group=[{COLOR_CYAN}]{self.config.selector_group}[/{COLOR_CYAN}]  "
@@ -177,8 +186,8 @@ class MainScreen(Screen):
             f"proxy=[{COLOR_CYAN}]{self.config.proxy_url}[/{COLOR_CYAN}]  "
             f"api=[{COLOR_CYAN}]{self.config.api_base}[/{COLOR_CYAN}]\n"
             f"Service regions  Claude: {color_unlock(unlock.claude)}  "
-            f"ChatGPT: {color_unlock(unlock.chatgpt)}  "
-            f"Gemini: {color_unlock(unlock.gemini)}"
+            f"Codex: {color_unlock(unlock.chatgpt)}"
+            f"{gemini_part}"
         )
 
         traffic = self.config.traffic
@@ -303,12 +312,16 @@ class ScanScreen(Screen):
         lines = []
         for node in result.nodes:
             marker = " → " if node.name == (result.best and result.best.name) else "   "
+            gemini_part = (
+                f"  Gemini:{color_unlock(node.unlock.gemini)}"
+                if node.unlock.gemini else ""
+            )
             lines.append(
                 f"{marker}[bold]{node.name:<20}[/bold]  "
                 f"{color_delay(node.delay)}  "
                 f"Claude:{color_unlock(node.unlock.claude)}  "
-                f"ChatGPT:{color_unlock(node.unlock.chatgpt)}  "
-                f"Gemini:{color_unlock(node.unlock.gemini)}"
+                f"Codex:{color_unlock(node.unlock.chatgpt)}"
+                f"{gemini_part}"
             )
 
         if result.best:
@@ -368,7 +381,10 @@ class NodeListScreen(Screen):
     async def _load_nodes(self) -> None:
         table = self.query_one("#node-table", DataTable)
         table.clear(columns=True)
-        table.add_columns("#", "Name", "Latency", "Claude", "ChatGPT", "Gemini")
+        columns = ["#", "Name", "Latency", "Claude", "Codex"]
+        if self.config.check_gemini:
+            columns.append("Gemini")
+        table.add_columns(*columns)
         table.cursor_type = "row"
 
         try:
@@ -419,15 +435,16 @@ class NodeListScreen(Screen):
         marker = "→" if name == self._current_node else " "
         delay = self._delays.get(name)
         unlock = self._unlocks.get(name)
-        table.add_row(
+        cells = [
             str(index),
             f"{marker} {name}",
             Text.from_markup(color_delay(delay)),
             self._unlock_text(unlock, "claude"),
             self._unlock_text(unlock, "chatgpt"),
-            self._unlock_text(unlock, "gemini"),
-            key=name,
-        )
+        ]
+        if self.config.check_gemini:
+            cells.append(self._unlock_text(unlock, "gemini"))
+        table.add_row(*cells, key=name)
 
     def _set_status(self, text: str) -> None:
         try:
@@ -528,13 +545,18 @@ class NodeListScreen(Screen):
 
     async def _measure_current_unlock(self, name: str) -> UnlockStatus:
         """Check unlock through the selector as currently set; update name's row."""
-        unlock = await check_unlock(self.config.proxy_url, use_cache=False)
+        unlock = await check_unlock(
+            self.config.proxy_url, use_cache=False, gemini=self.config.check_gemini
+        )
         self._unlocks[name] = unlock
         try:
             table = self.query_one("#node-table", DataTable)
         except NoMatches:
             return unlock
-        for col, field in (("Claude", "claude"), ("ChatGPT", "chatgpt"), ("Gemini", "gemini")):
+        cols = [("Claude", "claude"), ("Codex", "chatgpt")]
+        if self.config.check_gemini:
+            cols.append(("Gemini", "gemini"))
+        for col, field in cols:
             try:
                 table.update_cell(name, col, self._unlock_text(unlock, field))
             except Exception:
@@ -548,9 +570,10 @@ class NodeListScreen(Screen):
             delay = await self._measure_delay(name)
             unlock = await self._measure_current_unlock(name)
             delay_text = f"{delay}ms" if delay > 0 else "timeout"
+            gemini_part = f" Gemini:{unlock.gemini}" if unlock.gemini else ""
             self.notify(
                 f"Switched to: {name} ({delay_text})  "
-                f"Claude:{unlock.claude} ChatGPT:{unlock.chatgpt} Gemini:{unlock.gemini}",
+                f"Claude:{unlock.claude} Codex:{unlock.chatgpt}{gemini_part}",
                 severity="information" if unlock.primary_ok else "warning",
                 timeout=5,
             )
@@ -597,8 +620,9 @@ class NodeListScreen(Screen):
             await asyncio.sleep(0.3)
             delay = await self._measure_delay(name)
             unlock = await self._measure_current_unlock(name)
+            gemini_part = f" | Gemini {unlock.gemini}" if unlock.gemini else ""
             self.notify(
-                f"{name}: {delay}ms | Claude {unlock.claude} | ChatGPT {unlock.chatgpt} | Gemini {unlock.gemini}",
+                f"{name}: {delay}ms | Claude {unlock.claude} | Codex {unlock.chatgpt}{gemini_part}",
                 severity="information" if unlock.primary_ok else "warning",
                 timeout=5,
             )

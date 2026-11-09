@@ -33,22 +33,22 @@ async def _test_node_delay(
 
 async def _test_node_unlock(
     client: ClashClient, proxy_url: str, name: str, original_node: str,
-    group_name: str = "节点选择",
+    group_name: str = "节点选择", gemini: bool = False,
 ) -> UnlockStatus:
     """Switch to node, test unlock, switch back."""
     if not await client.switch_node(group_name, name):
-        return UnlockStatus(claude="fail", chatgpt="fail", gemini="fail")
+        return UnlockStatus(claude="fail", chatgpt="fail", gemini="fail" if gemini else "")
 
     try:
         await asyncio.sleep(0.3)
-        return await check_unlock(proxy_url, use_cache=False)
+        return await check_unlock(proxy_url, use_cache=False, gemini=gemini)
     finally:
         await client.switch_node(group_name, original_node)
 
 
 async def quick_scan(
     client: ClashClient, proxy_url: str, sample_size: int = 8,
-    group_name: str = "节点选择",
+    group_name: str = "节点选择", gemini: bool = False,
 ) -> ScanResult:
     """Random sample, test delay, then unlock for fast ones."""
     group = await client.get_group(group_name)
@@ -84,7 +84,7 @@ async def quick_scan(
         if delay >= 8000:
             continue
 
-        unlock = await _test_node_unlock(client, proxy_url, name, original, group_name)
+        unlock = await _test_node_unlock(client, proxy_url, name, original, group_name, gemini)
         node = Node(name=name, delay=delay, unlock=unlock)
         result_nodes.append(node)
         if unlock.primary_ok and (best is None or delay < (best.delay or 99999)):
@@ -103,6 +103,7 @@ async def quick_scan(
 
 async def full_scan(
     client: ClashClient, proxy_url: str, group_name: str = "节点选择",
+    gemini: bool = False,
 ) -> ScanResult:
     """Test all nodes: delay first, then unlock, sorted by speed."""
     group = await client.get_group(group_name)
@@ -130,7 +131,7 @@ async def full_scan(
     best: Node | None = None
 
     for name, delay in all_sorted:
-        unlock = await _test_node_unlock(client, proxy_url, name, original, group_name)
+        unlock = await _test_node_unlock(client, proxy_url, name, original, group_name, gemini)
         node = Node(name=name, delay=delay, unlock=unlock)
         result_nodes.append(node)
         if unlock.primary_ok and (best is None or delay < (best.delay or 99999)):

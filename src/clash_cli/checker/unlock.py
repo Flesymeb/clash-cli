@@ -129,25 +129,38 @@ async def check_gemini(proxy_url: str) -> str:
     return "fail"
 
 
-async def check_all(proxy_url: str, *, use_cache: bool = True) -> UnlockStatus:
-    """Run all unlock checks concurrently."""
+async def check_all(
+    proxy_url: str, *, use_cache: bool = True, gemini: bool = False
+) -> UnlockStatus:
+    """Run unlock checks concurrently.
+
+    Gemini is opt-in (``_custom.unlock-checks.gemini`` in the mixin);
+    when disabled it is neither probed nor displayed (``gemini == ""``).
+    """
+    cache_key = f"{proxy_url}#g={int(gemini)}"
     now = time.monotonic()
-    hit = _cache.get(proxy_url)
+    hit = _cache.get(cache_key)
     if use_cache:
         if hit and now - hit[0] < _CACHE_TTL:
             return hit[1]
         for url, status in _read_disk_cache().items():
             _cache.setdefault(url, (now, status))
-        hit = _cache.get(proxy_url)
+        hit = _cache.get(cache_key)
         if hit:
             return hit[1]
-    claude, chatgpt, gemini = await asyncio.gather(
+    claude, chatgpt, gemini_result = await asyncio.gather(
         check_claude(proxy_url),
         check_chatgpt(proxy_url),
-        check_gemini(proxy_url),
+        check_gemini(proxy_url) if gemini else _skip_check(),
     )
-    status = UnlockStatus(claude=claude, chatgpt=chatgpt, gemini=gemini)
+    status = UnlockStatus(
+        claude=claude, chatgpt=chatgpt, gemini=gemini_result if gemini else ""
+    )
     if use_cache:
-        _cache[proxy_url] = (now, status)
+        _cache[cache_key] = (now, status)
         _write_disk_cache(_cache)
     return status
+
+
+async def _skip_check() -> str:
+    return ""

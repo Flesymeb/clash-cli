@@ -15,7 +15,7 @@ class UnlockStatus:
     @property
     def all_ok(self) -> bool:
         return all(
-            s.startswith("ok") for s in [self.claude, self.chatgpt, self.gemini]
+            s.startswith("ok") for s in [self.claude, self.chatgpt, self.gemini] if s
         )
 
     @property
@@ -25,7 +25,9 @@ class UnlockStatus:
 
     def summary(self) -> str:
         parts = []
-        for name, val in [("Claude", self.claude), ("ChatGPT", self.chatgpt), ("Gemini", self.gemini)]:
+        for name, val in [("Claude", self.claude), ("Codex", self.chatgpt), ("Gemini", self.gemini)]:
+            if not val:
+                continue  # check disabled
             if val.startswith("ok"):
                 parts.append(f"{name}:✓ {val[3:]}")
             elif val.startswith("blocked"):

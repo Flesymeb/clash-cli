@@ -108,6 +108,7 @@ class Config:
     subscriptions: list[Subscription] = field(default_factory=list)
     current_sub_name: str = ""
     traffic: TrafficInfo | None = None
+    check_gemini: bool = False
     no_proxy_hosts: list[str] = field(default_factory=lambda: list(DEFAULT_NO_PROXY_HOSTS))
     config_errors: list[str] = field(default_factory=list)
 
@@ -175,6 +176,9 @@ class Config:
                 if isinstance(custom, dict):
                     if custom.get("selector-group"):
                         cfg.selector_group = str(custom["selector-group"])
+                    checks = custom.get("unlock-checks", {})
+                    if isinstance(checks, dict):
+                        cfg.check_gemini = bool(checks.get("gemini", False))
                     system_proxy = custom.get("system-proxy", {})
                     if isinstance(system_proxy, dict):
                         hosts = system_proxy.get("ignore-hosts")
