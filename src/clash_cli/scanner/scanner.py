@@ -41,7 +41,7 @@ async def _test_node_unlock(
 
     try:
         await asyncio.sleep(0.3)
-        return await check_unlock(proxy_url)
+        return await check_unlock(proxy_url, use_cache=False)
     finally:
         await client.switch_node(group_name, original_node)
 

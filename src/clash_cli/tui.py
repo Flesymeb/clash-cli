@@ -528,7 +528,7 @@ class NodeListScreen(Screen):
 
     async def _measure_current_unlock(self, name: str) -> UnlockStatus:
         """Check unlock through the selector as currently set; update name's row."""
-        unlock = await check_unlock(self.config.proxy_url)
+        unlock = await check_unlock(self.config.proxy_url, use_cache=False)
         self._unlocks[name] = unlock
         try:
             table = self.query_one("#node-table", DataTable)

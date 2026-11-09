@@ -303,7 +303,9 @@ async def cli_switch(node: str | None = None):
             ("latency", format_delay_plain(delay)),
         ]
         try:
-            unlock = await asyncio.wait_for(check_unlock(config.proxy_url), timeout=10)
+            unlock = await asyncio.wait_for(
+                check_unlock(config.proxy_url, use_cache=False), timeout=10
+            )
             rows.extend(
                 [
                     ("Claude region", unlock.claude),
@@ -568,7 +570,7 @@ async def cli_watch(interval: int = 120, once: bool = False):
         """Return True if node is ok, False if we had to switch."""
         try:
             current = await client.get_current_node(config.selector_group)
-            unlock = await check_unlock(config.proxy_url)
+            unlock = await check_unlock(config.proxy_url, use_cache=False)
             if unlock.primary_ok:
                 print(f"[ok] {current} Claude:{unlock.claude} ChatGPT:{unlock.chatgpt} Gemini:{unlock.gemini}")
                 return True

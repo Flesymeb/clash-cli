@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
+import time
+from pathlib import Path
 
 import httpx
 
@@ -17,6 +20,57 @@ GEMINI_MARKER = ',2,1,200,"'
 # Lightweight GETs; a blocked/dead endpoint must not hold status checks
 # hostage for the full client timeout.
 CHECK_TIMEOUT = 4.0
+
+# Short-lived result cache so repeated status renders don't re-pay the
+# dead-endpoint timeout. In-process results are mirrored to disk so short
+# CLI invocations (`ccli status` twice in a minute) benefit too. Callers
+# that just switched nodes must bypass it.
+_CACHE_TTL = 60.0
+_CACHE_FILE = Path.home() / ".cache" / "ccli" / "unlock.json"
+_cache: dict[str, tuple[float, UnlockStatus]] = {}
+
+
+def invalidate_unlock_cache() -> None:
+    _cache.clear()
+    try:
+        _CACHE_FILE.unlink()
+    except OSError:
+        pass
+
+
+def _read_disk_cache() -> dict[str, UnlockStatus]:
+    try:
+        raw = json.loads(_CACHE_FILE.read_text())
+        ts = float(raw.get("ts", 0))
+        if time.time() - ts >= _CACHE_TTL:
+            return {}
+        return {
+            url: UnlockStatus(
+                claude=item.get("claude", "fail"),
+                chatgpt=item.get("chatgpt", "fail"),
+                gemini=item.get("gemini", "fail"),
+            )
+            for url, item in raw.get("results", {}).items()
+        }
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def _write_disk_cache(results: dict[str, tuple[float, UnlockStatus]]) -> None:
+    payload = {
+        "ts": time.time(),
+        "results": {
+            url: {"claude": s.claude, "chatgpt": s.chatgpt, "gemini": s.gemini}
+            for url, (_ts, s) in results.items()
+        },
+    }
+    try:
+        _CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _CACHE_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload))
+        tmp.replace(_CACHE_FILE)
+    except OSError:
+        pass
 
 
 async def check_claude(proxy_url: str) -> str:
@@ -75,11 +129,25 @@ async def check_gemini(proxy_url: str) -> str:
     return "fail"
 
 
-async def check_all(proxy_url: str) -> UnlockStatus:
+async def check_all(proxy_url: str, *, use_cache: bool = True) -> UnlockStatus:
     """Run all unlock checks concurrently."""
+    now = time.monotonic()
+    hit = _cache.get(proxy_url)
+    if use_cache:
+        if hit and now - hit[0] < _CACHE_TTL:
+            return hit[1]
+        for url, status in _read_disk_cache().items():
+            _cache.setdefault(url, (now, status))
+        hit = _cache.get(proxy_url)
+        if hit:
+            return hit[1]
     claude, chatgpt, gemini = await asyncio.gather(
         check_claude(proxy_url),
         check_chatgpt(proxy_url),
         check_gemini(proxy_url),
     )
-    return UnlockStatus(claude=claude, chatgpt=chatgpt, gemini=gemini)
+    status = UnlockStatus(claude=claude, chatgpt=chatgpt, gemini=gemini)
+    if use_cache:
+        _cache[proxy_url] = (now, status)
+        _write_disk_cache(_cache)
+    return status
