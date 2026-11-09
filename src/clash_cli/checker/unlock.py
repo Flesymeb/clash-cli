@@ -14,11 +14,15 @@ GEMINI_BLOCKED = frozenset({"CHN", "RUS", "BLR", "CUB", "IRN", "PRK", "SYR", "HK
 
 GEMINI_MARKER = ',2,1,200,"'
 
+# Lightweight GETs; a blocked/dead endpoint must not hold status checks
+# hostage for the full client timeout.
+CHECK_TIMEOUT = 4.0
+
 
 async def check_claude(proxy_url: str) -> str:
     """Check Claude unlock via cdn-cgi/trace. Returns 'ok:XX', 'blocked:XX', or 'fail'."""
     try:
-        async with httpx.AsyncClient(proxy=proxy_url, timeout=8.0) as client:
+        async with httpx.AsyncClient(proxy=proxy_url, timeout=CHECK_TIMEOUT) as client:
             resp = await client.get("https://claude.ai/cdn-cgi/trace")
             for line in resp.text.splitlines():
                 if line.startswith("loc="):
@@ -34,7 +38,7 @@ async def check_claude(proxy_url: str) -> str:
 async def check_chatgpt(proxy_url: str) -> str:
     """Check ChatGPT unlock. Returns 'ok:XX', 'blocked:XX', or 'fail'."""
     try:
-        async with httpx.AsyncClient(proxy=proxy_url, timeout=8.0) as client:
+        async with httpx.AsyncClient(proxy=proxy_url, timeout=CHECK_TIMEOUT) as client:
             # Get region
             resp = await client.get("https://chat.openai.com/cdn-cgi/trace")
             loc = ""
@@ -58,7 +62,7 @@ async def check_chatgpt(proxy_url: str) -> str:
 async def check_gemini(proxy_url: str) -> str:
     """Check Gemini unlock via page source. Returns 'ok:XXX', 'blocked:XXX', or 'fail'."""
     try:
-        async with httpx.AsyncClient(proxy=proxy_url, timeout=8.0) as client:
+        async with httpx.AsyncClient(proxy=proxy_url, timeout=CHECK_TIMEOUT) as client:
             resp = await client.get("https://gemini.google.com")
             match = re.search(r',2,1,200,"([A-Z]{3})"', resp.text)
             if match:
