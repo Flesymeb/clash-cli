@@ -13,6 +13,7 @@ from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
+from textual.css.query import NoMatches
 from textual.screen import Screen
 from textual.widgets import (
     DataTable,
@@ -429,7 +430,11 @@ class NodeListScreen(Screen):
         )
 
     def _set_status(self, text: str) -> None:
-        self.query_one("#node-status", Static).update(text)
+        try:
+            self.query_one("#node-status", Static).update(text)
+        except NoMatches:
+            # The screen is being torn down; there is nothing left to update.
+            pass
 
     def _selected_node(self) -> str:
         table = self.query_one("#node-table", DataTable)
@@ -525,7 +530,10 @@ class NodeListScreen(Screen):
         """Check unlock through the selector as currently set; update name's row."""
         unlock = await check_unlock(self.config.proxy_url)
         self._unlocks[name] = unlock
-        table = self.query_one("#node-table", DataTable)
+        try:
+            table = self.query_one("#node-table", DataTable)
+        except NoMatches:
+            return unlock
         for col, field in (("Claude", "claude"), ("ChatGPT", "chatgpt"), ("Gemini", "gemini")):
             try:
                 table.update_cell(name, col, self._unlock_text(unlock, field))
