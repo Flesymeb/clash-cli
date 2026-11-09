@@ -1058,7 +1058,7 @@ class ScannerRegressionTests(unittest.TestCase):
     def test_quick_scan_uses_requested_group(self) -> None:
         original_check = scanner.check_unlock
 
-        async def fake_check(_proxy_url: str) -> UnlockStatus:
+        async def fake_check(_proxy_url: str, **_kwargs) -> UnlockStatus:
             return UnlockStatus(claude="ok:US", chatgpt="ok:US", gemini="blocked:CHN")
 
         async def run() -> None:
