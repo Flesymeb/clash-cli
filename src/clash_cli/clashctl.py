@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import shlex
 import signal
 import shutil
 import socket
@@ -186,7 +187,12 @@ class ClashctlBridge:
     def __init__(self, config: Config | None = None) -> None:
         self.config = config or Config.load()
         self.root = self.config.clashctl_dir.expanduser()
-        self.resources = self.root / "resources"
+        # clashctl >= 2026-11 keeps live state under data/; resources/ is the
+        # legacy layout and remains only as a development fallback.
+        self.data = self.root / "data"
+        self.resources = (
+            self.data if self.data.is_dir() else self.root / "resources"
+        )
         self.base_config = self.resources / "config.yaml"
         self.mixin_config = self.resources / "mixin.yaml"
         self.runtime_config = self.resources / "runtime.yaml"
@@ -195,9 +201,20 @@ class ClashctlBridge:
         self.profiles_dir = self.resources / "profiles"
         self.profiles_log = self.resources / "profiles.log"
         self.env = self._load_env()
-        self.kernel_name = self.env.get("KERNEL_NAME", "mihomo")
+        self.kernel_name = (
+            self.env.get("KERNEL_NAME")
+            or self.env.get("CLASHCTL_KERNEL")
+            or "mihomo"
+        )
         self.kernel = self.root / "bin" / self.kernel_name
         self.log_file = self.resources / f"{self.kernel_name}.log"
+        # Geodata (mmdb/geosite) and the web UI stay in resources/ under the
+        # data layout; mihomo needs -d pointed there for rule validation.
+        self.geodata_dir = (
+            (self.root / "resources")
+            if (self.root / "resources").is_dir()
+            else self.resources
+        )
         self.subconverter_dir = self.root / "bin" / "subconverter"
         self.subconverter = self.subconverter_dir / "subconverter"
         self.subconverter_config = self.subconverter_dir / "pref.yml"
@@ -285,30 +302,30 @@ class ClashctlBridge:
                 return await self.sub_add(url, force_convert=force_convert)
             if cmd in ("del", "delete", "rm"):
                 if len(rest) != 1:
-                    return ClashctlResult(2, stderr="usage: ccli sub del <id>")
+                    return ClashctlResult(2, stderr="usage: ccli sub del <name>")
                 if rest[0].startswith("-"):
                     return ClashctlResult(2, stderr=f"unknown option for sub del: {rest[0]}")
-                sub_id = self._parse_sub_id(rest[0], "usage: ccli sub del <id>")
-                if isinstance(sub_id, ClashctlResult):
-                    return sub_id
-                return self.sub_del(sub_id)
+                sub_name = self._parse_sub_name(rest[0], "usage: ccli sub del <name>")
+                if isinstance(sub_name, ClashctlResult):
+                    return sub_name
+                return self.sub_del(sub_name)
             if cmd == "use":
                 if len(rest) != 1:
-                    return ClashctlResult(2, stderr="usage: ccli sub use <id>")
+                    return ClashctlResult(2, stderr="usage: ccli sub use <name>")
                 if rest[0].startswith("-"):
                     return ClashctlResult(2, stderr=f"unknown option for sub use: {rest[0]}")
-                sub_id = self._parse_sub_id(rest[0], "usage: ccli sub use <id>")
-                if isinstance(sub_id, ClashctlResult):
-                    return sub_id
-                return await self.sub_use(sub_id)
+                sub_name = self._parse_sub_name(rest[0], "usage: ccli sub use <name>")
+                if isinstance(sub_name, ClashctlResult):
+                    return sub_name
+                return await self.sub_use(sub_name)
             if cmd == "update":
                 parsed = self._parse_sub_update_args(rest)
                 if isinstance(parsed, ClashctlResult):
                     return parsed
-                sub_id, force_convert, auto = parsed
+                sub_name, force_convert, auto = parsed
                 if auto:
                     return await self.sub_update_auto()
-                return await self.sub_update(sub_id, force_convert=force_convert)
+                return await self.sub_update(sub_name, force_convert=force_convert)
             if cmd == "log":
                 if len(rest) > 1:
                     return ClashctlResult(2, stderr="usage: ccli sub log [lines]")
@@ -366,13 +383,13 @@ class ClashctlBridge:
             0,
             "Usage: ccli sub COMMAND [OPTIONS]\n\n"
             "Commands:\n"
-            "  add [--convert] <url>     Add a subscription\n"
-            "  ls | list                 List subscriptions\n"
-            "  del | rm <id>             Delete a subscription\n"
-            "  use <id>                  Switch to a subscription\n"
-            "  update [--convert] [id]   Update a subscription\n"
-            "  update --auto             Install cron auto-update\n"
-            "  log                       Show subscription log",
+            "  add [--convert] <url>       Add a subscription\n"
+            "  ls | list                   List subscriptions\n"
+            "  del | rm <name>             Delete a subscription\n"
+            "  use <name>                  Switch to a subscription\n"
+            "  update [--convert] [name]   Update a subscription\n"
+            "  update --auto               Install cron auto-update\n"
+            "  log                         Show subscription log",
         )
 
     def _sub_command_help(self, cmd: str) -> ClashctlResult:
@@ -380,11 +397,11 @@ class ClashctlBridge:
             "add": "Usage: ccli sub add [--convert] <url>\n\nAdd a subscription. If <url> is omitted in a TTY, ccli prompts for it.",
             "ls": "Usage: ccli sub ls\n\nList subscriptions.",
             "list": "Usage: ccli sub list\n\nList subscriptions.",
-            "del": "Usage: ccli sub del <id>\n\nDelete a subscription that is not currently active.",
-            "delete": "Usage: ccli sub delete <id>\n\nDelete a subscription that is not currently active.",
-            "rm": "Usage: ccli sub rm <id>\n\nDelete a subscription that is not currently active.",
-            "use": "Usage: ccli sub use <id>\n\nSwitch to a subscription and restart mihomo if needed.",
-            "update": "Usage: ccli sub update [--convert|--auto] [id]\n\nUpdate the selected subscription, or a specific id.",
+            "del": "Usage: ccli sub del <name>\n\nDelete a subscription that is not currently active.",
+            "delete": "Usage: ccli sub delete <name>\n\nDelete a subscription that is not currently active.",
+            "rm": "Usage: ccli sub rm <name>\n\nDelete a subscription that is not currently active.",
+            "use": "Usage: ccli sub use <name>\n\nSwitch to a subscription and restart mihomo if needed.",
+            "update": "Usage: ccli sub update [--convert|--auto] [name]\n\nUpdate the selected subscription, or a specific one by name.",
             "log": "Usage: ccli sub log [lines]\n\nShow recent subscription log lines.",
         }
         return ClashctlResult(0, help_text.get(cmd, f"unknown sub command: {cmd}"))
@@ -405,17 +422,13 @@ class ClashctlBridge:
             return ClashctlResult(2, stderr="usage: ccli sub add [--convert] <url>")
         return url, force_convert
 
-    def _parse_sub_id(self, value: str, usage: str) -> int | ClashctlResult:
-        try:
-            sub_id = int(value)
-        except ValueError:
-            return ClashctlResult(2, stderr=f"{usage}\nerror: id must be a positive integer")
-        if sub_id <= 0:
-            return ClashctlResult(2, stderr=f"{usage}\nerror: id must be a positive integer")
-        return sub_id
+    def _parse_sub_name(self, value: str, usage: str) -> str | ClashctlResult:
+        if not value.strip():
+            return ClashctlResult(2, stderr=f"{usage}\nerror: name must not be empty")
+        return value.strip()
 
-    def _parse_sub_update_args(self, args: Sequence[str]) -> tuple[int | None, bool, bool] | ClashctlResult:
-        sub_id: int | None = None
+    def _parse_sub_update_args(self, args: Sequence[str]) -> tuple[str | None, bool, bool] | ClashctlResult:
+        sub_name: str | None = None
         force_convert = False
         auto = False
         for arg in args:
@@ -425,20 +438,20 @@ class ClashctlBridge:
                 auto = True
             elif arg.startswith("-"):
                 return ClashctlResult(2, stderr=f"unknown option for sub update: {arg}")
-            elif sub_id is None:
-                parsed = self._parse_sub_id(arg, "usage: ccli sub update [--convert|--auto] [id]")
+            elif sub_name is None:
+                parsed = self._parse_sub_name(arg, "usage: ccli sub update [--convert|--auto] [name]")
                 if isinstance(parsed, ClashctlResult):
                     return parsed
-                sub_id = parsed
+                sub_name = parsed
             else:
                 return ClashctlResult(2, stderr=f"unexpected argument for sub update: {arg}")
-        if auto and (sub_id is not None or force_convert):
+        if auto and (sub_name is not None or force_convert):
             return ClashctlResult(2, stderr="usage: ccli sub update --auto")
-        return sub_id, force_convert, auto
+        return sub_name, force_convert, auto
 
     def _profiles(self) -> dict[str, Any]:
         data = _load_yaml(self.profiles_meta)
-        data.setdefault("use", 0)
+        data.setdefault("use", "")
         data.setdefault("profiles", [])
         return data
 
@@ -460,21 +473,23 @@ class ClashctlBridge:
     def _save_profiles(self, data: dict[str, Any]) -> None:
         _write_yaml(self.profiles_meta, data)
 
-    def _profile_by_id(self, sub_id: int) -> dict[str, Any]:
-        for profile in self._profiles().get("profiles", []):
-            if int(profile.get("id", -1)) == sub_id:
+    def _profile_by_name(self, sub_name: str) -> dict[str, Any]:
+        profiles = self._profiles().get("profiles", [])
+        for profile in profiles:
+            if str(profile.get("name", "")) == sub_name:
                 return profile
-        raise ClashctlError(f"subscription id not found: {sub_id}")
+        known = ", ".join(str(p.get("name", "")) for p in profiles) or "none"
+        raise ClashctlError(f"subscription not found: {sub_name} (known: {known})")
 
     def _log_sub(self, message: str) -> None:
         self.profiles_log.parent.mkdir(parents=True, exist_ok=True)
         with self.profiles_log.open("a") as f:
             f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} {message}\n")
 
-    def _save_traffic_userinfo(self, sub_id: int, raw: str) -> None:
+    def _save_traffic_userinfo(self, sub_name: str, raw: str) -> None:
         data = self._profiles()
         for profile in data.get("profiles", []):
-            if int(profile.get("id", -1)) == sub_id:
+            if str(profile.get("name", "")) == sub_name:
                 if profile.get("traffic") != raw:
                     profile["traffic"] = raw
                     self._save_profiles(data)
@@ -735,7 +750,9 @@ class ClashctlBridge:
 
     async def _valid_config(self, path: Path) -> None:
         self._ensure_runtime()
-        code, out, err = await self._run_process([self.kernel, "-d", path.parent, "-f", path, "-t"])
+        code, out, err = await self._run_process(
+            [self.kernel, "-d", self.geodata_dir, "-f", path, "-t"]
+        )
         if code != 0:
             raise ClashctlError(err or out or f"invalid config: {path}")
 
@@ -751,18 +768,29 @@ class ClashctlBridge:
         if custom is not None:
             mixin["_custom"] = custom
 
+        # Mixin keys were renamed prefix/suffix -> prepend/append upstream;
+        # accept both spellings so old and new mixin files keep working.
+        rules_pre = list(rules_mixin.get("prepend") or rules_mixin.get("prefix") or [])
+        rules_post = list(rules_mixin.get("append") or rules_mixin.get("suffix") or [])
         combined_rules = (
-            list(rules_mixin.get("prefix", []) or [])
+            rules_pre
             + [rule.format(selector=self.config.selector_group) for rule in AI_SELECTOR_RULES]
             + list(base.get("rules", []) or [])
-            + list(rules_mixin.get("suffix", []) or [])
+            + rules_post
         )
         runtime["rules"] = [
             rule for rule in combined_rules
-            if not self._is_terminal_match(rule) and not self._is_legacy_direct_ip_rule(rule)
+            if not self._is_terminal_match(rule) and (rule in rules_pre or not self._is_legacy_direct_ip_rule(rule))
         ]
         runtime["rules"].append(f"MATCH,{self.config.selector_group}")
         runtime["proxies"] = self._merge_named_list(base.get("proxies", []), proxies_mixin)
+        chain = custom.get("chain-proxy", {}) if isinstance(custom, dict) else {}
+        if isinstance(chain, dict) and chain.get("name"):
+            chain_name = chain["name"]
+            chain_types = chain.get("types", ["ss", "vmess", "vless", "trojan"])
+            for proxy in runtime["proxies"]:
+                if proxy.get("name") != chain_name and proxy.get("type") in chain_types:
+                    proxy["dialer-proxy"] = chain_name
         runtime["proxy-groups"] = self._merge_groups(base.get("proxy-groups", []), groups_mixin)
         self._apply_fallback_group(runtime, custom)
         self._ensure_rule_targets(runtime)
@@ -860,7 +888,9 @@ class ClashctlBridge:
     def _merge_named_list(self, base_items: list[dict[str, Any]], mixin: dict[str, Any]) -> list[dict[str, Any]]:
         overrides = {item.get("name"): item for item in mixin.get("override", []) or []}
         merged = [overrides.get(item.get("name"), item) for item in base_items]
-        return list(mixin.get("prefix", []) or []) + merged + list(mixin.get("suffix", []) or [])
+        pre = list(mixin.get("prepend") or mixin.get("prefix") or [])
+        post = list(mixin.get("append") or mixin.get("suffix") or [])
+        return pre + merged + post
 
     def _merge_groups(self, base_items: list[dict[str, Any]], mixin: dict[str, Any]) -> list[dict[str, Any]]:
         merged = self._merge_named_list(base_items, mixin)
@@ -870,10 +900,8 @@ class ClashctlBridge:
             if not extra:
                 continue
             existing = list(group.get("proxies", []) or [])
-            for item in extra:
-                if item not in existing:
-                    existing.append(item)
-            group["proxies"] = existing
+            # Injected members go first, matching the clashctl merge behaviour.
+            group["proxies"] = list(extra) + [item for item in existing if item not in extra]
         return merged
 
     def _ensure_rule_targets(self, runtime: dict[str, Any]) -> None:
@@ -916,6 +944,23 @@ class ClashctlBridge:
             group_names.add(target)
             policy_names.add(target)
 
+    def _default_sub_name(self, url: str) -> str:
+        """Host-based default name, matching clashctl's clashsub convention."""
+        if url.startswith("file://"):
+            return "local"
+        host = url.split("://", 1)[-1]
+        for sep in ("/", "?", ":"):
+            host = host.split(sep, 1)[0]
+        return host or "local"
+
+    def _unique_sub_name(self, base: str) -> str:
+        names = {str(p.get("name", "")) for p in self._profiles().get("profiles", [])}
+        name, n = base, 1
+        while name in names:
+            n += 1
+            name = f"{base}-{n}"
+        return name
+
     async def sub_add(self, url: str, *, force_convert: bool = False) -> ClashctlResult:
         url = url.strip()
         if not url:
@@ -925,31 +970,33 @@ class ClashctlBridge:
         for profile in data.get("profiles", []):
             if profile.get("url") == url:
                 return ClashctlResult(1, stderr="subscription URL already exists")
-        next_id = max([int(p.get("id", 0)) for p in data.get("profiles", [])] or [0]) + 1
-        profile_path = self.profiles_dir / f"{next_id}.yaml"
+        name = self._unique_sub_name(self._default_sub_name(url))
+        profile_path = self.profiles_dir / f"{name}.yaml"
         await self._download_subscription(url, self.temp_config, force_convert=force_convert)
         self.temp_config.replace(profile_path)
-        entry = {"id": next_id, "path": str(profile_path), "url": url}
+        entry = {"name": name, "path": str(profile_path), "url": url}
         if self._last_userinfo:
             entry["traffic"] = self._last_userinfo
         data["profiles"].append(entry)
         self._save_profiles(data)
         masked_url = mask_url(url)
-        self._log_sub(f"added subscription [{next_id}] {masked_url}")
-        return ClashctlResult(0, f"subscription added: [{next_id}] {masked_url}")
+        self._log_sub(f"added subscription [{name}] {masked_url}")
+        return ClashctlResult(0, f"subscription added: [{name}] {masked_url}")
 
-    def sub_del(self, sub_id: int) -> ClashctlResult:
+    def sub_del(self, sub_name: str) -> ClashctlResult:
         data = self._profiles()
-        if int(data.get("use", 0)) == sub_id:
-            return ClashctlResult(1, stderr=f"subscription {sub_id} is currently in use")
-        profile = self._profile_by_id(sub_id)
+        if str(data.get("use", "")) == sub_name:
+            return ClashctlResult(1, stderr=f"subscription {sub_name} is currently in use")
+        profile = self._profile_by_name(sub_name)
         path = Path(profile.get("path", "")).expanduser()
         if path.exists():
             path.unlink()
-        data["profiles"] = [p for p in data.get("profiles", []) if int(p.get("id", -1)) != sub_id]
+        data["profiles"] = [
+            p for p in data.get("profiles", []) if str(p.get("name", "")) != sub_name
+        ]
         self._save_profiles(data)
-        self._log_sub(f"deleted subscription [{sub_id}] {mask_url(str(profile.get('url', '')))}")
-        return ClashctlResult(0, f"subscription deleted: [{sub_id}]")
+        self._log_sub(f"deleted subscription [{sub_name}] {mask_url(str(profile.get('url', '')))}")
+        return ClashctlResult(0, f"subscription deleted: [{sub_name}]")
 
     def sub_list(self) -> ClashctlResult:
         return ClashctlResult(0, yaml.safe_dump(self._masked_profiles(), allow_unicode=True, sort_keys=False).strip())
@@ -968,8 +1015,8 @@ class ClashctlBridge:
             return None
         return self._fallback_int(settings, "size", 5)
 
-    async def sub_use(self, sub_id: int) -> ClashctlResult:
-        profile = self._profile_by_id(sub_id)
+    async def sub_use(self, sub_name: str) -> ClashctlResult:
+        profile = self._profile_by_name(sub_name)
         path = Path(profile.get("path", "")).expanduser()
         if not path.exists():
             raise ClashctlError(f"profile file not found: {path}")
@@ -985,7 +1032,7 @@ class ClashctlBridge:
             self.config = Config.load(self.root)
             await self.merge_config()
             data = self._profiles()
-            data["use"] = sub_id
+            data["use"] = sub_name
             self._save_profiles(data)
             self.config = Config.load(self.root)
             await self.restart_if_running()
@@ -995,8 +1042,8 @@ class ClashctlBridge:
                 raise
             raise ClashctlError(f"{error}{rollback_error}") from error
 
-        self._log_sub(f"selected subscription [{sub_id}] {mask_url(str(profile.get('url', '')))}")
-        lines = [f"subscription selected: [{sub_id}]"]
+        self._log_sub(f"selected subscription [{sub_name}] {mask_url(str(profile.get('url', '')))}")
+        lines = [f"subscription selected: [{sub_name}]"]
         if refresh_size is not None:
             if not self._pid():
                 lines.append(
@@ -1011,22 +1058,22 @@ class ClashctlBridge:
                     lines.append(f"fallback remains off (stale): {error}")
         return ClashctlResult(0, "\n".join(lines))
 
-    async def sub_update(self, sub_id: int | None = None, *, force_convert: bool = False) -> ClashctlResult:
+    async def sub_update(self, sub_name: str | None = None, *, force_convert: bool = False) -> ClashctlResult:
         data = self._profiles()
-        use_id = sub_id or int(data.get("use", 0) or 0)
-        profile = self._profile_by_id(use_id)
+        use_name = sub_name or str(data.get("use", "") or "")
+        profile = self._profile_by_name(use_name)
         url = profile.get("url", "")
         if not url:
-            return ClashctlResult(1, stderr=f"subscription {use_id} has empty URL")
+            return ClashctlResult(1, stderr=f"subscription {use_name} has empty URL")
         await self._download_subscription(url, self.temp_config, force_convert=force_convert)
         profile_path = Path(profile.get("path", "")).expanduser()
         profile_path.write_bytes(self.temp_config.read_bytes())
         if self._last_userinfo:
-            self._save_traffic_userinfo(use_id, self._last_userinfo)
-        self._log_sub(f"updated subscription [{use_id}] {mask_url(str(url))}")
-        if int(data.get("use", 0)) == use_id:
-            return await self.sub_use(use_id)
-        return ClashctlResult(0, f"subscription updated: [{use_id}]")
+            self._save_traffic_userinfo(use_name, self._last_userinfo)
+        self._log_sub(f"updated subscription [{use_name}] {mask_url(str(url))}")
+        if str(data.get("use", "")) == use_name:
+            return await self.sub_use(use_name)
+        return ClashctlResult(0, f"subscription updated: [{use_name}]")
 
     async def sub_update_auto(self) -> ClashctlResult:
         crontab = shutil.which("crontab")
@@ -1070,8 +1117,10 @@ class ClashctlBridge:
         if isinstance(custom, dict) and custom.get("selector-group"):
             return str(custom["selector-group"])
         rules = mixin.get("rules", {})
-        suffix = rules.get("suffix", []) if isinstance(rules, dict) else []
-        for rule in reversed(suffix or []):
+        append = rules.get("append") or rules.get("suffix") or []
+        if not isinstance(append, list):
+            append = []
+        for rule in reversed(append):
             if isinstance(rule, str) and rule.strip().upper().startswith("MATCH,"):
                 return rule.strip().split(",", 2)[1].strip()
         return "节点选择"
@@ -1400,11 +1449,11 @@ class ClashctlBridge:
             add("WARN", "api", f"not checked: {config.api_base}")
 
         if config.subscriptions:
-            current_ids = {sub.id for sub in config.subscriptions}
-            if config.current_sub_id in current_ids:
-                add("OK", "sub", f"{len(config.subscriptions)} profiles, current #{config.current_sub_id}")
+            current_names = {sub.name for sub in config.subscriptions}
+            if config.current_sub_name in current_names:
+                add("OK", "sub", f"{len(config.subscriptions)} profiles, current {config.current_sub_name}")
             else:
-                add("FAIL", "sub", f"current subscription #{config.current_sub_id} is not in profiles")
+                add("FAIL", "sub", f"current subscription {config.current_sub_name} is not in profiles")
         else:
             add("WARN", "sub", "no subscriptions configured")
 
@@ -1530,11 +1579,35 @@ class ClashctlBridge:
             ("api", api),
             ("shell", shell),
         ]
-        if config.current_sub_id:
-            rows.append(("sub", f"#{config.current_sub_id}"))
+        if config.current_sub_name:
+            rows.append(("sub", config.current_sub_name))
         if note:
             rows.append(("state", note))
         return _format_rows("clash-cli", rows)
+
+    async def _run_service_function(self, func: str) -> str:
+        """Delegate to the clashctl bash service manager.
+
+        Single source of truth for process lifecycle: it owns the pid record,
+        so starting/stopping from here can never desync with clashon/clashoff.
+        """
+        entry = self.root / "scripts" / "cmd" / "clashctl.sh"
+        if not entry.exists():
+            raise ClashctlError(f"clashctl scripts not found: {entry}")
+        env = dict(os.environ, CLASHCTL_HOME=str(self.root))
+        proc = await asyncio.create_subprocess_exec(
+            "bash",
+            "-c",
+            f". {shlex.quote(str(entry))} && {func}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            env=env,
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
+        text = out.decode(errors="replace").strip()
+        if proc.returncode != 0:
+            raise ClashctlError(f"{func} failed: {text or f'exit {proc.returncode}'}")
+        return text
 
     async def on(self) -> ClashctlResult:
         self._ensure_runtime()
@@ -1542,53 +1615,26 @@ class ClashctlBridge:
         if pid:
             return ClashctlResult(0, await self._runtime_summary("on", pid, "already running"))
         await self.merge_config()
-        self.log_file.parent.mkdir(parents=True, exist_ok=True)
-        with self.log_file.open("ab") as log:
-            proc = await asyncio.create_subprocess_exec(
-                str(self.kernel),
-                "-d",
-                str(self.resources),
-                "-f",
-                str(self.runtime_config),
-                stdout=log,
-                stderr=log,
-                start_new_session=True,
-            )
-
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=0.8)
-        except asyncio.TimeoutError:
-            pass
-        else:
+        await self._run_service_function("clashon")
+        pid = self._pid()
+        if not pid:
             tail = _tail_file(self.log_file)
             detail = f"\n{tail}" if tail else ""
             return ClashctlResult(
                 1,
-                stderr=f"{self.kernel_name} exited immediately with code {proc.returncode}{detail}",
+                stderr=f"{self.kernel_name} did not stay running after clashon{detail}",
             )
-
-        pid = self._pid() or proc.pid
         return ClashctlResult(0, await self._runtime_summary("on", pid, "started"))
 
     async def off(self) -> ClashctlResult:
         pid = self._pid()
         if not pid:
             return ClashctlResult(0, await self._runtime_summary("off", None, "already stopped"))
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            return ClashctlResult(0, await self._runtime_summary("off", None, "stopped"))
-        except PermissionError as e:
-            raise ClashctlError(f"permission denied stopping {self.kernel_name} pid {pid}") from e
-        if not await self._wait_until_stopped(pid, timeout=1.0):
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            except PermissionError as e:
-                raise ClashctlError(f"permission denied killing {self.kernel_name} pid {pid}") from e
-            if not await self._wait_until_stopped(pid, timeout=1.0):
-                raise ClashctlError(f"{self.kernel_name} pid {pid} did not stop")
+        # clashctl's clashoff only unsets the current shell env; clashstop is
+        # the kernel-stopper under the new layout.
+        await self._run_service_function("clashstop")
+        if self._pid():
+            raise ClashctlError(f"{self.kernel_name} is still running after clashstop")
         return ClashctlResult(0, await self._runtime_summary("off", None, "stopped"))
 
     async def _wait_until_stopped(self, pid: int, timeout: float) -> bool:

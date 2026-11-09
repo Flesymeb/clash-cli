@@ -361,7 +361,7 @@ async def cli_shell_status(proxy: str = "on") -> None:
         table.add_column(style="dim")
         table.add_row("proxy", endpoint, f"api {api}")
         table.add_row("selected", Text(selected, style="cyan bold"), "")
-        table.add_row("route", " -> ".join(chain), f"sub #{config.current_sub_id}")
+        table.add_row("route", " -> ".join(chain), f"sub {config.current_sub_name}")
 
         console.print(title)
         console.print(table)
@@ -371,7 +371,7 @@ async def cli_shell_status(proxy: str = "on") -> None:
     print(f"{'proxy':>6}  {endpoint}  api {api}")
     print(f"{'selected':>8}  {selected}")
     route = " -> ".join(chain) if api == "ok" else config.selector_group
-    print(f"{'route':>8}  {route}  sub #{config.current_sub_id}")
+    print(f"{'route':>8}  {route}  sub {config.current_sub_name}")
 
 
 def cli_shell_init(shell: str | None = None, install: bool = False) -> None:

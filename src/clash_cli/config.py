@@ -92,7 +92,7 @@ class TrafficInfo:
 
 @dataclass
 class Subscription:
-    id: int
+    name: str
     path: str
     url: str
     is_current: bool = False
@@ -106,7 +106,7 @@ class Config:
     selector_group: str = "节点选择"
     clashctl_dir: Path = field(default_factory=lambda: Path.home() / "clashctl")
     subscriptions: list[Subscription] = field(default_factory=list)
-    current_sub_id: int = 0
+    current_sub_name: str = ""
     traffic: TrafficInfo | None = None
     no_proxy_hosts: list[str] = field(default_factory=lambda: list(DEFAULT_NO_PROXY_HOSTS))
     config_errors: list[str] = field(default_factory=list)
@@ -137,7 +137,14 @@ class Config:
                     cfg.clashctl_dir = d
                     break
 
-        resources = cfg.clashctl_dir / "resources"
+        # clashctl >= 2026-11 keeps live state under data/; resources/ is the
+        # legacy layout and remains only as a development fallback.
+        data = cfg.clashctl_dir / "data"
+        resources = (
+            data
+            if (data / "mixin.yaml").exists() or (data / "profiles.yaml").exists()
+            else cfg.clashctl_dir / "resources"
+        )
 
         # Read mixin.yaml for secret and port
         mixin_path = resources / "mixin.yaml"
@@ -156,8 +163,11 @@ class Config:
                     ctrl = f"http://{ctrl}"
                 cfg.api_base = ctrl
                 rules = mixin.get("rules", {})
-                suffix = rules.get("suffix", []) if isinstance(rules, dict) else []
-                for rule in reversed(suffix or []):
+                # "append" is the current key; "suffix" is the legacy spelling.
+                append = rules.get("append") or rules.get("suffix") or []
+                if not isinstance(append, list):
+                    append = []
+                for rule in reversed(append):
                     if isinstance(rule, str) and rule.strip().upper().startswith("MATCH,"):
                         cfg.selector_group = rule.strip().split(",", 2)[1].strip()
                         break
@@ -194,19 +204,20 @@ class Config:
                     data = yaml.safe_load(f) or {}
                 if not isinstance(data, dict):
                     raise ValueError("expected a YAML mapping")
-                cfg.current_sub_id = data.get("use", 0)
+                cfg.current_sub_name = str(data.get("use", "") or "")
                 for p in data.get("profiles", []):
                     if not isinstance(p, dict):
                         raise ValueError("profiles entries must be mappings")
+                    name = str(p.get("name", "") or "")
                     cfg.subscriptions.append(
                         Subscription(
-                            id=p.get("id", 0),
+                            name=name,
                             path=p.get("path", ""),
                             url=p.get("url", ""),
-                            is_current=p.get("id") == cfg.current_sub_id,
+                            is_current=name == cfg.current_sub_name,
                         )
                     )
-                    if p.get("id") == cfg.current_sub_id and p.get("traffic"):
+                    if name == cfg.current_sub_name and p.get("traffic"):
                         cfg.traffic = TrafficInfo.parse(str(p["traffic"]))
             except Exception as e:
                 cfg.config_errors.append(f"{profiles_path}: {e}")

@@ -172,7 +172,7 @@ class MainScreen(Screen):
             f"[bold]clash-cli[/bold]  "
             f"group=[{COLOR_CYAN}]{self.config.selector_group}[/{COLOR_CYAN}]  "
             f"node=[{COLOR_CYAN}]{current}[/{COLOR_CYAN}]  "
-            f"sub=[{COLOR_CYAN}]#{self.config.current_sub_id}[/{COLOR_CYAN}]\n"
+            f"sub=[{COLOR_CYAN}]{self.config.current_sub_name}[/{COLOR_CYAN}]\n"
             f"proxy=[{COLOR_CYAN}]{self.config.proxy_url}[/{COLOR_CYAN}]  "
             f"api=[{COLOR_CYAN}]{self.config.api_base}[/{COLOR_CYAN}]\n"
             f"Service regions  Claude: {color_unlock(unlock.claude)}  "
@@ -662,15 +662,15 @@ class SubScreen(Screen):
 
         table = self.query_one("#sub-table", DataTable)
         table.clear(columns=True)
-        table.add_columns("#", "ID", "Path", "URL")
+        table.add_columns("#", "Name", "Path", "URL")
         table.cursor_type = "row"
 
         for i, sub in enumerate(self.config.subscriptions):
             marker = "✓" if sub.is_current else " "
-            table.add_row(marker, str(sub.id), sub.path, mask_url(sub.url))
+            table.add_row(marker, sub.name, sub.path, mask_url(sub.url))
 
         header = self.query_one("#sub-header", Static)
-        header.update(f"Subscriptions  current=#{self.config.current_sub_id}")
+        header.update(f"Subscriptions  current={self.config.current_sub_name}")
 
         # Focus on current
         for i, sub in enumerate(self.config.subscriptions):
@@ -683,7 +683,7 @@ class SubScreen(Screen):
         row = event.cursor_row
         if row is not None and row < len(self.config.subscriptions):
             sub = self.config.subscriptions[row]
-            asyncio.create_task(self._use_subscription(sub.id))
+            asyncio.create_task(self._use_subscription(sub.name))
 
     def _selected_subscription(self):
         table = self.query_one("#sub-table", DataTable)
@@ -717,18 +717,18 @@ class SubScreen(Screen):
                 self.client = self.app.client
         return True
 
-    async def _use_subscription(self, sub_id: int) -> None:
-        await self._run_sub_command(["use", sub_id], f"Subscription #{sub_id} selected")
+    async def _use_subscription(self, sub_name: str) -> None:
+        await self._run_sub_command(["use", sub_name], f"Subscription {sub_name} selected")
 
-    async def _update_subscription(self, sub_id: int) -> None:
-        await self._run_sub_command(["update", sub_id], f"Subscription #{sub_id} updated")
+    async def _update_subscription(self, sub_name: str) -> None:
+        await self._run_sub_command(["update", sub_name], f"Subscription {sub_name} updated")
 
     async def action_update_subscription(self) -> None:
         sub = self._selected_subscription()
         if sub is None:
             self.notify("No subscription selected", severity="warning", timeout=3)
             return
-        await self._update_subscription(sub.id)
+        await self._update_subscription(sub.name)
 
     def action_back(self) -> None:
         self.app.pop_screen()

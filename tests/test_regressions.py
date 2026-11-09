@@ -82,7 +82,7 @@ class CliRegressionTests(unittest.TestCase):
             self.assertEqual(result.returncode, 2)
             self.assertIn("usage: ccli tun", result.stderr)
 
-    def test_on_reports_immediate_kernel_exit(self) -> None:
+    def test_on_reports_when_kernel_not_running_after_clashon(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             resources = root / "resources"
@@ -92,21 +92,14 @@ class CliRegressionTests(unittest.TestCase):
             (resources / "config.yaml").write_text("proxies: []\nproxy-groups: []\nrules: []\n")
             (resources / "mixin.yaml").write_text("mixed-port: 7890\n")
             kernel = bin_dir / "mihomo"
-            kernel.write_text(
-                "#!/usr/bin/env sh\n"
-                "for arg in \"$@\"; do\n"
-                "  if [ \"$arg\" = \"-t\" ]; then exit 0; fi\n"
-                "done\n"
-                "echo fake kernel failed >&2\n"
-                "exit 7\n"
-            )
+            kernel.write_text("#!/usr/bin/env sh\nexit 0\n")
             kernel.chmod(0o755)
 
             bridge = ClashctlBridge(Config(clashctl_dir=root))
+            bridge._run_service_function = AsyncMock(return_value="")  # type: ignore[method-assign]
             result = asyncio.run(bridge.on())
             self.assertEqual(result.returncode, 1)
-            self.assertIn("exited immediately", result.stderr)
-            self.assertIn("fake kernel failed", result.stderr)
+            self.assertIn("did not stay running after clashon", result.stderr)
 
     def test_yaml_writer_quotes_numeric_reality_short_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -239,7 +232,7 @@ class CliRegressionTests(unittest.TestCase):
             self.assertIn("mihomo pid 4321", result.stdout)
             self.assertNotIn("mihomo already running", result.stdout)
 
-    def test_off_waits_for_kernel_process_to_exit(self) -> None:
+    def test_off_delegates_stop_to_service_manager(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             resources = root / "resources"
@@ -263,6 +256,14 @@ class CliRegressionTests(unittest.TestCase):
                             break
                         await asyncio.sleep(0.05)
                     self.assertEqual(bridge._pid(), proc.pid)
+
+                    async def fake_service(func: str) -> str:
+                        self.assertEqual(func, "clashstop")
+                        proc.terminate()
+                        await proc.wait()
+                        return ""
+
+                    bridge._run_service_function = fake_service  # type: ignore[method-assign]
                     result = await bridge.off()
                     self.assertEqual(result.returncode, 0)
                     await asyncio.wait_for(proc.wait(), timeout=2)
@@ -347,7 +348,9 @@ class CliRegressionTests(unittest.TestCase):
             rules = runtime["rules"]
             self.assertEqual([rule for rule in rules if rule.startswith("MATCH,")], ["MATCH,节点选择"])
             self.assertEqual(rules[-1], "MATCH,节点选择")
-            self.assertNotIn("DOMAIN,api64.ipify.org,DIRECT", rules)
+            # A legacy direct-IP rule explicitly declared in the mixin prefix
+            # is whitelisted and survives the legacy filter.
+            self.assertIn("DOMAIN,api64.ipify.org,DIRECT", rules)
             expected_ai_rules = [
                 "DOMAIN-SUFFIX,claude.ai,节点选择",
                 "DOMAIN-SUFFIX,anthropic.com,节点选择",
@@ -628,10 +631,10 @@ class CliRegressionTests(unittest.TestCase):
             )
             (resources / "config.yaml").write_bytes(old_profile.read_bytes())
             (resources / "profiles.yaml").write_text(
-                "use: 1\n"
+                "use: one\n"
                 "profiles:\n"
-                f"  - {{id: 1, path: {old_profile}, url: https://one.example/sub}}\n"
-                f"  - {{id: 2, path: {new_profile}, url: https://two.example/sub}}\n"
+                f"  - {{name: one, path: {old_profile}, url: https://one.example/sub}}\n"
+                f"  - {{name: two, path: {new_profile}, url: https://two.example/sub}}\n"
             )
             (resources / "mixin.yaml").write_text(
                 "_custom:\n"
@@ -650,7 +653,7 @@ class CliRegressionTests(unittest.TestCase):
             bridge = ClashctlBridge(Config.load(root))
             bridge._pid = lambda: None  # type: ignore[method-assign]
 
-            result = asyncio.run(bridge.sub_use(2))
+            result = asyncio.run(bridge.sub_use("two"))
 
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("fallback refresh deferred", result.stdout)
@@ -682,9 +685,9 @@ class CliRegressionTests(unittest.TestCase):
             )
             (resources / "config.yaml").write_bytes(profile.read_bytes())
             (resources / "profiles.yaml").write_text(
-                "use: 1\n"
+                "use: one\n"
                 "profiles:\n"
-                f"  - {{id: 2, path: {profile}, url: https://two.example/sub}}\n"
+                f"  - {{name: two, path: {profile}, url: https://two.example/sub}}\n"
             )
             (resources / "mixin.yaml").write_text(
                 "secret: test-secret\n"
@@ -712,7 +715,7 @@ class CliRegressionTests(unittest.TestCase):
                 ]
             )
 
-            result = asyncio.run(bridge.sub_use(2))
+            result = asyncio.run(bridge.sub_use("two"))
 
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("fallback refreshed: new-a -> new-b", result.stdout)
@@ -778,20 +781,20 @@ class CliRegressionTests(unittest.TestCase):
                 self.fail(f"converter health check inherited unsupported proxy environment: {error}")
         self.assertFalse(ready)
 
-    def test_subscription_id_validation_returns_usage(self) -> None:
+    def test_subscription_name_validation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             bridge = ClashctlBridge(Config(clashctl_dir=Path(tmp)))
-            cases = [
-                ["use", "abc"],
-                ["del", "abc"],
-                ["update", "abc"],
-                ["use", "0"],
-            ]
-            for args in cases:
+            # Extra arguments are a usage error.
+            for args in (["use", "a", "b"], ["del"], ["update", "a", "b"]):
                 with self.subTest(args=args):
                     result = asyncio.run(bridge.clashsub(args))
                     self.assertEqual(result.returncode, 2)
-                    self.assertIn("id must be a positive integer", result.stderr)
+            # Any non-empty name parses; unknown names fail at lookup.
+            for args in (["use", "abc"], ["del", "abc"], ["update", "abc"]):
+                with self.subTest(args=args):
+                    result = asyncio.run(bridge.clashsub(args))
+                    self.assertEqual(result.returncode, 1)
+                    self.assertIn("subscription not found: abc", result.stderr)
 
     def test_subscription_output_masks_urls(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1207,11 +1210,11 @@ class TrafficInfoTests(unittest.TestCase):
                 "mixed-port: 7890\nexternal-controller: 127.0.0.1:9090\nsecret: s\n"
             )
             (resources / "profiles.yaml").write_text(yaml.safe_dump({
-                "use": 8,
+                "use": "eight",
                 "profiles": [
-                    {"id": 3, "path": "/tmp/3.yaml", "url": "https://x/3"},
+                    {"name": "three", "path": "/tmp/3.yaml", "url": "https://x/3"},
                     {
-                        "id": 8,
+                        "name": "eight",
                         "path": "/tmp/8.yaml",
                         "url": "https://x/8",
                         "traffic": "upload=1; download=2; total=10; expire=1794761926",
@@ -1225,7 +1228,7 @@ class TrafficInfoTests(unittest.TestCase):
 
             # Non-current subscription traffic must not leak in.
             data = yaml.safe_load((resources / "profiles.yaml").read_text())
-            data["use"] = 3
+            data["use"] = "three"
             (resources / "profiles.yaml").write_text(yaml.safe_dump(data))
             cfg = Config.load(Path(tmp))
             self.assertIsNone(cfg.traffic)
@@ -1277,20 +1280,20 @@ class SubscriptionUserinfoCaptureTests(unittest.TestCase):
             bridge = ClashctlBridge.__new__(ClashctlBridge)
             bridge.profiles_meta = Path(tmp) / "profiles.yaml"
             _write_yaml(bridge.profiles_meta, {
-                "use": 8,
-                "profiles": [{"id": 8, "path": "/tmp/8.yaml", "url": "https://x/8"}],
+                "use": "eight",
+                "profiles": [{"name": "eight", "path": "/tmp/8.yaml", "url": "https://x/8"}],
             })
-            bridge._save_traffic_userinfo(8, "upload=1; download=2; total=3; expire=4")
+            bridge._save_traffic_userinfo("eight", "upload=1; download=2; total=3; expire=4")
             data = yaml.safe_load(bridge.profiles_meta.read_text())
             self.assertEqual(data["profiles"][0]["traffic"], "upload=1; download=2; total=3; expire=4")
 
             # Idempotent: same value must not rewrite the file.
             before = bridge.profiles_meta.stat().st_mtime_ns
-            bridge._save_traffic_userinfo(8, "upload=1; download=2; total=3; expire=4")
+            bridge._save_traffic_userinfo("eight", "upload=1; download=2; total=3; expire=4")
             self.assertEqual(bridge.profiles_meta.stat().st_mtime_ns, before)
 
-            # Unknown id is a no-op.
-            bridge._save_traffic_userinfo(99, "upload=9")
+            # Unknown name is a no-op.
+            bridge._save_traffic_userinfo("ninety-nine", "upload=9")
             data = yaml.safe_load(bridge.profiles_meta.read_text())
             self.assertEqual(len(data["profiles"]), 1)
 
